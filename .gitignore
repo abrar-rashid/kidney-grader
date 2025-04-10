@@ -1,0 +1,45 @@
+# python
+__pycache__/
+*.py[cod]
+*.so
+*.ipynb_checkpoints/
+
+# envs
+.env
+*.env
+.venv/
+env/
+venv/
+.kidney_grader_env/
+
+data/
+*.DS_Store
+
+checkpoints/
+*.pth
+*.pt
+
+output/
+segmentation/outputs/
+quantification/outputs/
+grading/outputs/
+patch_out/
+test/
+*.log
+*.npy
+*.csv
+*.txt
+*.json
+*.png
+
+# temp/debug
+*.tmp
+*.bak
+*.swp
+
+# system files
+Thumbs.db
+.DS_Store
+
+.vscode/
+.idea/

@@ -28,7 +28,6 @@ test/
 *.log
 *.npy
 *.csv
-*.txt
 *.json
 *.png
 

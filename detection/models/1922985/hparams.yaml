@@ -1,0 +1,17 @@
+class_names:
+- '0': lymphocytes
+  '1': monocytes
+  '2': other
+data_name:
+- monkey_ihc_gold
+dim_in: 4
+embedding_dim: 64
+encoder: mobilenet_v3
+from_file: null
+l_fns:
+- cross_entropy
+num_classes:
+- 3
+patch_size: 128
+pretrained: true
+weights: null

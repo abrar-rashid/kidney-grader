@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 import numpy as np
 
 def setup_logging(output_dir: Path) -> None:
+    os.makedirs(output_dir, exist_ok=True)
     log_dir = output_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     logging.basicConfig(
@@ -19,7 +20,7 @@ def setup_logging(output_dir: Path) -> None:
 class KidneyGraderPipeline:
     # Main pipeline for kidney biopsy grading
     
-    def __init__(self, output_dir: str, model_path: str = "checkpoints/improved_unet_best.pth"):
+    def __init__(self, output_dir: str, model_path: str = "checkpoints/improved_unet_best.pth"): # TODO add instanseg model path here
         self.output_dir = Path(output_dir)
         self.model_path = model_path
 
@@ -69,38 +70,64 @@ class KidneyGraderPipeline:
             logger.error(f"Segmentation stage failed: {str(e)}", exc_info=True)
             raise
     
-    def run_stage2(self, stage1_result: Dict[str, Any]) -> Dict[str, Any]:
-        from quantification.detect_mononuclear_cells import detect_mononuclear_cells
-        from quantification.tubule_utils import get_tubule_instances, identify_foci
-        # to run inflammatory/mononuclear cell detection and quantification wrt a structure (tubules by default)
+    def run_stage2(self, stage1_result: dict) -> dict:
+        from detection.detect import run_inflammatory_cell_detection
+
         logger = logging.getLogger(__name__)
-        logger.info(f"Running Stage 2: Quantification for {stage1_result['wsi_name']}")
-        
-        try:
-            cell_detection_result = detect_mononuclear_cells(
-                wsi_path=stage1_result["wsi_path"]
-            )
-            
-            tubule_mask, num_tubules = get_tubule_instances(
-                mask=stage1_result["segmentation_mask"],
-                tissue_type=1  # 1 = tubuli
-            )
-            
-            foci_mask = identify_foci(tubule_mask) # clusters nearby tubules into foci for the tubulitis score calcualtion
-            
-            return {
-                **stage1_result,
-                "cell_coordinates": cell_detection_result["coordinates"],
-                "cell_visualization": cell_detection_result["visualization_path"],
-                "tubule_mask": tubule_mask,
-                "num_tubules": num_tubules,
-                "foci_mask": foci_mask
-            }
-        except Exception as e:
-            logger.error(f"Quantification stage failed: {str(e)}", exc_info=True)
-            raise
-    
-    def run_stage3(self, stage2_result: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("Running Stage 2: Inflammatory cell detection using InstanSeg + classifier")
+
+        wsi_name = stage1_result["wsi_name"]
+        wsi_path = stage1_result["wsi_path"]
+        output_dir = self.output_dir / "detection" / wsi_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        inflam_cell_mask = run_inflammatory_cell_detection(
+            wsi_path=wsi_path,
+            output_dir=output_dir,
+            model_path="detection/models"
+        )
+
+        mask_path = output_dir / "inflam_cell_instance_mask.npy"
+        np.save(mask_path, inflam_cell_mask)
+
+        logger.info(f"Detected {np.unique(inflam_cell_mask).size - 1} inflam_cells")
+
+        return {
+            "wsi_name": wsi_name,
+            "wsi_path": wsi_path,
+            "inflam_cell_mask": inflam_cell_mask,
+            "inflam_cell_mask_path": str(mask_path)
+        }
+
+
+    def run_stage3(self, stage1_result: dict, stage2_result: dict) -> dict:
+        from quantification.quantify import count_inflam_cells_per_tubule
+
+        logger = logging.getLogger(__name__)
+        logger.info("Running Stage 3: Quantification of inflammatory cells per tubule")
+
+        wsi_name = stage1_result["wsi_name"]
+        tubule_mask = np.load(self.segmentation_dir / wsi_name / f"{wsi_name}_full_instance_mask_class1.npy")
+        inflam_cell_mask = np.load(stage2_result["inflam_cell_mask_path"])
+
+        per_tubule_counts = count_inflam_cells_per_tubule(tubule_mask, inflam_cell_mask)
+
+        output = {
+            "wsi_name": wsi_name,
+            "per_tubule_inflam_cell_counts": per_tubule_counts,
+            "total_inflam_cells": len(np.unique(inflam_cell_mask)) - 1,
+            "total_tubules": len(np.unique(tubule_mask)) - 1
+        }
+
+        output_path = self.quantification_dir / f"{wsi_name}_quantification.npy"
+        np.save(output_path, output)
+
+        logger.info(f"Quantified inflam_cells in {output['total_tubules']} tubules")
+
+        return output
+
+
+    def run_stage4(self, stage2_result: Dict[str, Any]) -> Dict[str, Any]:
         from grading.banff_grade import calculate_tubulitis_score
         # compute the final Banff grading for the tubulitis score
         logger = logging.getLogger(__name__)
@@ -132,7 +159,8 @@ class KidneyGraderPipeline:
         try:
             stage1_result = self.run_stage1(wsi_path)
             stage2_result = self.run_stage2(stage1_result)
-            final_result = self.run_stage3(stage2_result)
+            stage3_result = self.run_stage3(stage2_result)
+            final_result = self.run_stage4(stage3_result)
             
             logger.info(f"Pipeline completed successfully for {wsi_path}")
             return final_result
@@ -149,7 +177,7 @@ def main():
     parser.add_argument("--output_dir", required=True, help="Directory where results will be saved")
 
     parser.add_argument("--stage", 
-        choices=["1", "2", "3", "all", "segment", "quantify", "grade"],
+        choices=["1", "2", "3", "4", "all", "segment", "detect", "quantify", "grade"],
         default="all",
         help="Which stage to run (default: all). Can use stage number (1,2,3) or name (segment,quantify,grade)"
     )
@@ -163,8 +191,9 @@ def main():
 
     stage_map = {
         "segment": "1",
-        "quantify": "2",
-        "grade": "3"
+        "detect": "2",
+        "quantify": "3",
+        "grade": "4"
     }
     stage = stage_map.get(args.stage, args.stage)
 
@@ -173,18 +202,29 @@ def main():
             output_dir=args.output_dir,
             model_path=args.model_path
         )
-
         wsi_path = args.input_path
 
         if stage == "1":
             pipeline.run_stage1(wsi_path)
+
         elif stage == "2":
-            stage1_result = pipeline.run_stage1(wsi_path)
-            pipeline.run_stage2(stage1_result)
+            # directly run stage 2 with only WSI path
+            stage2_result = pipeline.run_stage2({
+                "wsi_name": Path(wsi_path).stem,
+                "wsi_path": wsi_path
+            })
+        # TODO fix logic for this or change to error for stage == 3 and 4
         elif stage == "3":
             stage1_result = pipeline.run_stage1(wsi_path)
             stage2_result = pipeline.run_stage2(stage1_result)
-            pipeline.run_stage3(stage2_result)
+            pipeline.run_stage3(stage1_result, stage2_result)
+
+        elif stage == "4":
+            stage1_result = pipeline.run_stage1(wsi_path)
+            stage2_result = pipeline.run_stage2(stage1_result)
+            stage3_result = pipeline.run_stage3(stage1_result, stage2_result)
+            pipeline.run_stage4(stage3_result)
+
         else:  # default: all
             pipeline.run_pipeline(wsi_path)
 

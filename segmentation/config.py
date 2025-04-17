@@ -18,3 +18,5 @@ LABEL_COLOURS = {
     3: (0, 0, 255),     # artery
     4: (0, 255, 255),   # glomeruli
 }
+
+CLASS_NAMES = ['Background', 'Tubuli', 'Vein', 'Artery', 'Glomeruli']

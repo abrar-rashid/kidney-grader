@@ -1,29 +1,6 @@
 import numpy as np
-import cv2
-from scipy.ndimage import label
-import logging
 
-def get_tubule_instances(mask, tissue_type=1):
-    # Segmntation mask labels: 0 = background 1 = tubules, 2 = veins, 3 = arteries, 4 = glomeruli
-
-    binary = (mask == tissue_type).astype(np.uint8) # makes binary mask for chosen label
-    # applying morphological opertions to clean up mask
-    kernel = np.ones((3, 3), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    
-    instance_mask, num_instances = label(binary) # perform connected component labeling to get unique instance ids
-    
-    # removing small (potentially false positive) instances 
-    for label_id in range(1, num_instances + 1):
-        instance_size = np.sum(instance_mask == label_id)
-        if instance_size < 100: # TODO might need to adjust threshold
-            instance_mask[instance_mask == label_id] = 0
-    # relabel to make labels consecutive again
-    instance_mask = label(instance_mask > 0)[0]
-    num_instances = np.max(instance_mask)
-    
-    logging.info(f"Found {num_instances} instances of tissue type {tissue_type}")
-    return instance_mask, num_instances
+from segmentation.utils import get_binary_class_mask
 
 def identify_foci(instance_mask, min_distance=100): 
     # Based on Banff tubulitis score specification, identifies spacial clusters of tubules, known as foci, which are within

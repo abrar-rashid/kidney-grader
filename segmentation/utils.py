@@ -6,23 +6,64 @@ from torch.utils.data import Dataset
 from tiffslide import TiffSlide
 from torchvision import transforms
 import torch
+import logging
+from scipy.ndimage import label
 from .improved_unet import ImprovedUNet
 from .config import LABEL_COLOURS, PATCH_SIZE, PATCH_OVERLAP, TISSUE_THRESHOLD, PATCH_LEVEL, NUM_CLASSES
 
 
-def colour_code_mask(mask):
+def get_instance_mask(mask, tissue_type=1):
+    # get instance segmentation mask for a specific tissue type using watershed algorithm.
+    binary = get_binary_class_mask(mask, tissue_type)  # 0/1 mask for selected class
+
+    # clean up with morphological opening (removes noise, but doesn't merge objects)
+    kernel = np.ones((3, 3), np.uint8)
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    # distance transform for separating close regions
+    dist_transform = cv2.distanceTransform(opened, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist_transform, 0.2 * dist_transform.max(), 1, 0)
+    sure_fg = np.uint8(sure_fg)
+
+    # sure background via dilation
+    sure_bg = cv2.dilate(opened, kernel, iterations=2)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    # marker labelling
+    _, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1  # ensure background is 1 instead of 0
+    markers[unknown == 1] = 0
+
+    # watershed needs a 3-channel image
+    color_img = cv2.cvtColor((opened * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    markers = cv2.watershed(color_img, markers)
+
+    # convert markers to instance mask: 0 = background, 1...n = instance ids
+    instance_mask = np.where(markers > 1, markers - 1, 0).astype(np.uint16)
+    num_instances = instance_mask.max()
+
+    logging.info(f"Found {num_instances} instances of tissue type {tissue_type}")
+    return instance_mask, num_instances
+
+
+def get_binary_class_mask(mask, class_idx):
+    # convert multi-class mask to binary mask for a specific class.
+    return (mask == class_idx).astype(np.uint8)
+
+
+def create_visualization(mask, original_image=None, alpha=0.4):
+    #Create color-coded mask and optionally overlay it on the original image
     h, w = mask.shape
     colour_mask = np.zeros((h, w, 3), dtype=np.uint8)
     for label_id, colour in LABEL_COLOURS.items():
         colour_mask[mask == label_id] = colour
-    return Image.fromarray(colour_mask)
-
-def overlay_mask_on_image(original_image, mask_image, alpha=0.4):
-    original = original_image.convert("RGBA")
-    mask = mask_image.convert("RGBA")
+    colour_mask = Image.fromarray(colour_mask)
     
-    blended = Image.blend(original, mask, alpha)
-    return blended
+    if original_image is not None:
+        original = original_image.convert("RGBA")
+        mask_rgba = colour_mask.convert("RGBA")
+        return Image.blend(original, mask_rgba, alpha)
+    return colour_mask
 
 
 def load_model(checkpoint_path, device, weights_only=True, num_classes=NUM_CLASSES):
@@ -37,6 +78,7 @@ def load_model(checkpoint_path, device, weights_only=True, num_classes=NUM_CLASS
 
 
 class PatchFolderDataset(Dataset):
+    #dataset class for loading patches from a folder
     def __init__(self, patch_dir, transform=None):
         self.paths = [os.path.join(patch_dir, f"patch_{i}.png") for i in range(len(os.listdir(patch_dir))) 
               if os.path.exists(os.path.join(patch_dir, f"patch_{i}.png"))]
@@ -57,12 +99,8 @@ class PatchFolderDataset(Dataset):
 
 
 def extract_patches_from_wsi(wsi_path, out_dir, patch_size=PATCH_SIZE, overlap=PATCH_OVERLAP,
-    level=PATCH_LEVEL, tissue_threshold=TISSUE_THRESHOLD):
-
-    import matplotlib.pyplot as plt
-    from PIL import ImageDraw
-    from .utils import is_tissue_patch
-
+    level=PATCH_LEVEL, tissue_threshold=TISSUE_THRESHOLD, tissue_filtering=False):
+    # Extracts patches from a Whole Slide Image and save them to disk
     os.makedirs(out_dir, exist_ok=True)
     slide = TiffSlide(wsi_path)
     width, height = slide.level_dimensions[level]
@@ -72,37 +110,25 @@ def extract_patches_from_wsi(wsi_path, out_dir, patch_size=PATCH_SIZE, overlap=P
     inference_flags = {}
     count = 0
 
-    # debug overlay image
-    scale_factor = 1 / 16  # use same factor in both directions
-    thumb_width = int(width * scale_factor)
-    thumb_height = int(height * scale_factor)
-    downsampled = slide.get_thumbnail((thumb_width, thumb_height)).convert("RGB")
-    draw = ImageDraw.Draw(downsampled)
+    from tqdm import tqdm
 
-    for y in range(0, height - patch_size + 1, stride):
-        for x in range(0, width - patch_size + 1, stride):
-            patch = slide.read_region((x, y), level, (patch_size, patch_size)).convert("RGB")
-            patch_np = np.array(patch)
+    coords = [
+        (x, y)
+        for y in range(0, height - patch_size + 1, stride)
+        for x in range(0, width - patch_size + 1, stride)
+    ]
 
-            # draw a box that is green for a tissue patch and red for non-tissue patch
-            rect = [
-                int(x * scale_factor),
-                int(y * scale_factor),
-                int((x + patch_size) * scale_factor),
-                int((y + patch_size) * scale_factor),
-            ]
+    for x, y in tqdm(coords, desc="Extracting Patches", unit="patch"):
+        patch = slide.read_region((x, y), level, (patch_size, patch_size)).convert("RGB")
+        patch_np = np.array(patch)
 
-            should_infer = is_tissue_patch(patch_np, tissue_threshold)
-            patch.save(os.path.join(out_dir, f"patch_{count}.png"))
+        should_infer = is_tissue_patch(patch_np, tissue_threshold) if tissue_filtering else True
+        patch.save(os.path.join(out_dir, f"patch_{count}.png"))
 
-            slide_map[count] = (x, y, patch_size, patch_size)
-            inference_flags[count] = should_infer
+        slide_map[count] = (x, y, patch_size, patch_size)
+        inference_flags[count] = should_infer
 
-            draw.rectangle(rect, outline="green" if should_infer else "red", width=1)
-            count += 1
-
-    debug_path = os.path.join(out_dir, "patch_debug_overlay.png")
-    downsampled.save(debug_path)
+        count += 1
 
     patch_mask = np.zeros((height, width), dtype=np.uint8)
     for i, (x, y, w, h) in slide_map.items():
@@ -111,12 +137,12 @@ def extract_patches_from_wsi(wsi_path, out_dir, patch_size=PATCH_SIZE, overlap=P
     Image.fromarray((patch_mask * 255).astype(np.uint8)).save(os.path.join(out_dir, "patch_inference_mask.png"))
 
     print(f"Total patches saved: {count}")
-    print(f"Saved debug patch overlay: {debug_path}")
     return slide_map, inference_flags
 
 
 def is_tissue_patch(patch_np, threshold=0.05):
-    # HSV-based tissue filtering
+    # TODO FIX
+    # determine if a patch contains enough tissue using HSV color space analysis
     hsv = cv2.cvtColor(patch_np, cv2.COLOR_RGB2HSV)
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]

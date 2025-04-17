@@ -11,6 +11,7 @@ __pycache__/
 env/
 venv/
 .kidney_grader_env/
+.kg_env/
 
 data/
 *.DS_Store
@@ -30,6 +31,7 @@ test/
 *.csv
 *.json
 *.png
+*.tiff
 
 # temp/debug
 *.tmp

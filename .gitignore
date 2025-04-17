@@ -21,6 +21,8 @@ checkpoints/
 *.pt
 
 output/
+outputdir/
+res/
 segmentation/outputs/
 quantification/outputs/
 grading/outputs/

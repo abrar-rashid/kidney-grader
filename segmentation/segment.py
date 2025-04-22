@@ -3,8 +3,9 @@ import logging
 from pathlib import Path
 import numpy as np
 from PIL import Image
-import tqdm
+from tqdm import tqdm
 import torch
+import cv2
 from torch.utils.data import DataLoader
 from matplotlib import cm
 import tifffile
@@ -89,6 +90,7 @@ def process_wsi(wsi_path, model, device, output_dir):
         else:
             dummy = np.zeros((NUM_CLASSES, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
             predictions.append(dummy)
+    torch.cuda.empty_cache()
     # need 1:1 alignment between preds and masks
     assert len(predictions) == len(slide_map), \
         f"Mismatch: {len(predictions)} predictions vs {len(slide_map)} patches"
@@ -113,22 +115,34 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None):
         instance_mask, num_instances = get_instance_mask(full_mask, tissue_type=class_idx)
         if num_instances == 0:
             continue
-            
+        
+        print("Saving instance mask for class", class_idx)
         instance_mask_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.npy"
         np.save(instance_mask_path, instance_mask)
         instance_mask_paths[class_idx] = str(instance_mask_path)
         
+        print("Visualizing instance mask for class", class_idx)
         instance_mask_normalized = (instance_mask.astype(np.float32) / instance_mask.max()) if instance_mask.max() > 0 else instance_mask
         cmap = cm.get_cmap('nipy_spectral', instance_mask.max() + 1)
         instance_mask_colored = (cmap(instance_mask_normalized)[:, :, :3] * 255).astype(np.uint8)
         
+        print("Saving colored instance mask for class", class_idx)
         instance_png_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.png"
         Image.fromarray(instance_mask_colored).save(instance_png_path)
         
+        print("Saving instance mask as TIFF for class", class_idx)
+        downsample_factor = 4
+        h, w = instance_mask_colored.shape[:2]
+        resized_mask = Image.fromarray(instance_mask_colored).resize(
+            (w // downsample_factor, h // downsample_factor), resample=Image.BILINEAR
+        )
         instance_colored_tiff_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff"
-        tifffile.imwrite(instance_colored_tiff_path, instance_mask_colored, photometric='rgb')
+        resized_mask = cv2.resize(instance_mask_colored, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_LINEAR)
+        tifffile.imwrite(instance_colored_tiff_path, resized_mask, photometric='rgb')
 
-    # Save color-coded mask
+
+
+    # Save color-coded mask 
     colour_mask = create_visualization(full_mask)
     full_mask_path = output_dir / f"{wsi_name}_full_mask.png"
     colour_mask.save(full_mask_path)

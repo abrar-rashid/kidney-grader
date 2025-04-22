@@ -3,7 +3,9 @@
 import os
 from matplotlib import pyplot as plt
 import numpy as np
+from tqdm import tqdm
 import torch
+import time
 import tifffile
 from tiffslide import TiffSlide
 from pathlib import Path
@@ -34,7 +36,7 @@ class InflammatoryCellDetector:
         preds_all = []
 
         with torch.no_grad(), torch.amp.autocast("cuda"):
-            for i in range(0, len(x), batch_size):
+            for i in tqdm(range(0, len(x), batch_size), desc="Classifying cells", unit="batch"):
                 xb = x[i:i+batch_size].float()
                 preds = [m(xb) for m in self.classifier]
                 pred = torch.stack(preds).mean(0)
@@ -44,22 +46,42 @@ class InflammatoryCellDetector:
         return y_hat.softmax(1).argmax(1)
 
     def detect(self, img_array, mask_array):
-        img_tensor = _to_tensor_float32(img_array).to(self.device)
-        mask_tensor = _to_tensor_float32(mask_array).to(self.device)
+        start_time = time.time()
+        with torch.no_grad():
+            t0 = time.time()
+            labels, _ = self.detector.eval_medium_image(
+                img_array,
+                pixel_size=0.242,
+                rescale_output=True,
+                seed_threshold=0.1,
+                tile_size=1024
+            )
+            print(f"[timing] segmentation: {time.time() - t0:.2f}s")
 
-        labels, _ = self.detector.eval_medium_image(
-            img_array, pixel_size=0.242, rescale_output=True, seed_threshold=0.1, tile_size=1024
-        )
-        labels = labels.to(self.device) * torch.tensor(mask_tensor).bool()
-        labels = torch_fastremap(labels)
-        crops, masks = get_masked_patches(labels, img_tensor, patch_size=PATCH_SIZE)
-        x = torch.cat((crops / 255.0, masks), dim=1).to(self.device)
-        
-        torch.cuda.empty_cache()
-        y_hat = self.classify_batch(x)
-        coords = centroids_from_lab(labels)[0].cpu().numpy()
+            img_tensor = _to_tensor_float32(img_array).to(self.device, non_blocking=True)
+            mask_tensor = _to_tensor_float32(mask_array).to(self.device, non_blocking=True)
 
-        inflam_cell_coords = coords[y_hat.cpu().numpy() == 1]  # class 1 = Inflammatory Cell
+            labels = labels * mask_tensor.bool().cpu()
+            labels = torch_fastremap(labels)
+
+            t1 = time.time()
+            crops, masks = get_masked_patches(labels, img_tensor.cpu(), patch_size=PATCH_SIZE)
+
+            x_cpu = torch.cat((crops / 255.0, masks), dim=1).pin_memory()
+            x_gpu = x_cpu.to(self.device, non_blocking=True)
+            print(f"[timing] patch extraction: {time.time() - t1:.2f}s")
+
+            torch.cuda.empty_cache()
+
+            t2 = time.time()
+            y_hat = self.classify_batch(x_gpu)
+            print(f"[timing] classification: {time.time() - t2:.2f}s")
+
+            coords = centroids_from_lab(labels)[0].cpu().numpy()
+            inflam_cell_coords = coords[y_hat.cpu().numpy() == 1]
+
+        elapsed_time = time.time() - start_time
+        print(f"[INFO] detect() completed in {elapsed_time:.2f} seconds")
 
         return inflam_cell_coords, labels, y_hat
 
@@ -79,6 +101,7 @@ def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path:
         classifier_model_paths=[os.path.join(model_path, ckpt) for ckpt in CLASSIFIER_MODELS],
     )
 
+    print("Running detection of inflammatory cells with instanseg...")
     coords, _, _ = detector.detect(image, mask)
 
     # create instance mask with unique labels

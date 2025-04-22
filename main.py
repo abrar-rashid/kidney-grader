@@ -1,8 +1,12 @@
 import os
 import logging
+import json
 from pathlib import Path
 from typing import Optional, Dict, Any
 import numpy as np
+from grading.banff_grade import calculate_tubulitis_score
+from quantification.quantify import analyze_tubule_cell_distribution, convert_numpy_types, count_cells_in_tubules, save_counts_csv
+from quantification.tubule_utils import identify_foci
 
 def setup_logging(output_dir: Path) -> None:
     os.makedirs(output_dir, exist_ok=True)
@@ -28,6 +32,7 @@ class KidneyGraderPipeline:
         
         # output dirs are stage-specific
         self.segmentation_dir = self.output_dir / "segmentation"
+        self.detection_dir = self.output_dir / "detection"
         self.quantification_dir = self.output_dir / "quantification"
         self.grading_dir = self.output_dir / "grading"
 
@@ -42,8 +47,24 @@ class KidneyGraderPipeline:
         # to run semantic segmentation of WSI
         logger = logging.getLogger(__name__)
         logger.info(f"Running Stage 1: Segmentation for {wsi_path}")
+
         wsi_name = Path(wsi_path).stem
-        
+        output_dir = self.segmentation_dir / wsi_name
+        mask_npy_path = output_dir / f"{wsi_name}_full_mask.npy"
+        mask_png_path = output_dir / f"{wsi_name}_full_mask.png"
+
+        if mask_npy_path.exists():
+            logger.info(f"Segmentation mask already exists at {mask_npy_path}, skipping segmentation.")
+            instance_mask_paths = {
+                int(p.stem.split("class")[-1]): str(p)
+                for p in output_dir.glob(f"{wsi_name}_full_instance_mask_class*.npy")
+            }
+            return {
+                "mask_path": str(mask_png_path),
+                "mask_npy_path": str(mask_npy_path),
+                "instance_mask_paths": instance_mask_paths
+            }
+
         try:
             segmentation_result = run_segment(
                 in_path=wsi_path,
@@ -57,38 +78,36 @@ class KidneyGraderPipeline:
             if not os.path.exists(mask_npy_path):
                 raise FileNotFoundError(f"Segmentation .npy mask not found at {mask_npy_path}")
             
-            segmentation_array = np.load(mask_npy_path)
-
             return {
-                "wsi_name": wsi_name,
-                "wsi_path": wsi_path,
-                "segmentation_mask": segmentation_array,
                 "mask_path": mask_png_path,
                 "mask_npy_path": mask_npy_path,
+                "instance_mask_paths": segmentation_result["instance_mask_paths"]
             }
         except Exception as e:
             logger.error(f"Segmentation stage failed: {str(e)}", exc_info=True)
             raise
-    
-    def run_stage2(self, stage1_result: dict) -> dict:
+
+    def run_stage2(self, wsi_path) -> dict:
         from detection.detect import run_inflammatory_cell_detection
 
         logger = logging.getLogger(__name__)
         logger.info("Running Stage 2: Inflammatory cell detection using InstanSeg + classifier")
 
-        wsi_name = stage1_result["wsi_name"]
-        wsi_path = stage1_result["wsi_path"]
+        wsi_name = Path(wsi_path).stem
         output_dir = self.output_dir / "detection" / wsi_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        inflam_cell_mask = run_inflammatory_cell_detection(
-            wsi_path=wsi_path,
-            output_dir=output_dir,
-            model_path="detection/models"
-        )
-
         mask_path = output_dir / "inflam_cell_instance_mask.npy"
-        np.save(mask_path, inflam_cell_mask)
+        if mask_path.exists():
+            logger.info(f"Inflammatory cell mask already exists at {mask_path}, skipping detection.")
+            inflam_cell_mask = np.load(mask_path)
+        else:
+            inflam_cell_mask = run_inflammatory_cell_detection(
+                wsi_path=wsi_path,
+                output_dir=output_dir,
+                model_path="detection/models"
+            )
+            np.save(mask_path, inflam_cell_mask)
 
         logger.info(f"Detected {np.unique(inflam_cell_mask).size - 1} inflam_cells")
 
@@ -100,56 +119,85 @@ class KidneyGraderPipeline:
         }
 
 
-    def run_stage3(self, stage1_result: dict, stage2_result: dict) -> dict:
-        from quantification.quantify import count_inflam_cells_per_tubule
-
+    def run_stage3(self, wsi_path: str, tubule_mask_path: Path = None, inflam_cell_mask_path: Path = None) -> dict:
         logger = logging.getLogger(__name__)
         logger.info("Running Stage 3: Quantification of inflammatory cells per tubule")
 
-        wsi_name = stage1_result["wsi_name"]
-        tubule_mask = np.load(self.segmentation_dir / wsi_name / f"{wsi_name}_full_instance_mask_class1.npy")
-        inflam_cell_mask = np.load(stage2_result["inflam_cell_mask_path"])
+        wsi_name = Path(wsi_path).stem
 
-        per_tubule_counts = count_inflam_cells_per_tubule(tubule_mask, inflam_cell_mask)
+        if tubule_mask_path is None:
+            # default path for tubule mask (stage 1 output)
+            tubule_mask_path = self.segmentation_dir / wsi_name / f"{wsi_name}_full_instance_mask_class1.npy"
+        tubule_mask = np.load(tubule_mask_path)
+
+        if inflam_cell_mask_path is None:
+            # default path for inflammatory cell mask (stage 2 output)
+            inflam_cell_mask_path = self.detection_dir / wsi_name / "inflam_cell_instance_mask.npy"
+        inflam_cell_mask = np.load(inflam_cell_mask_path)
+
+        # generate foci mask
+        foci_mask = identify_foci(tubule_mask, min_distance=100)
+
+        # inflammatory cell coordinates
+        cell_coords = np.argwhere(inflam_cell_mask > 0)
+
+        # full dataframe of counts
+        counts_df = count_cells_in_tubules(cell_coords, tubule_mask, foci_mask)
+
+        # save counts CSV but also json
+        output_csv_path = self.quantification_dir / f"{wsi_name}_tubule_counts.csv"
+        save_counts_csv(counts_df, output_csv_path)
+        summary_stats = analyze_tubule_cell_distribution(counts_df)
+
+        per_tubule_counts = dict(zip(counts_df['tubule_id'], counts_df['cell_count'])) #simpler count dict
 
         output = {
             "wsi_name": wsi_name,
-            "per_tubule_inflam_cell_counts": per_tubule_counts,
-            "total_inflam_cells": len(np.unique(inflam_cell_mask)) - 1,
-            "total_tubules": len(np.unique(tubule_mask)) - 1
+            "total_inflam_cells": int(len(np.unique(inflam_cell_mask)) - 1),
+            "total_tubules": int(len(np.unique(tubule_mask)) - 1),
+            "tubule_counts_csv": str(output_csv_path),
+            "per_tubule_inflam_cell_counts": {int(k): int(v) for k, v in per_tubule_counts.items()},
+            "summary_stats": convert_numpy_types(summary_stats)
         }
 
-        output_path = self.quantification_dir / f"{wsi_name}_quantification.npy"
-        np.save(output_path, output)
+        output_json_path = self.quantification_dir / f"{wsi_name}_quantification.json"
+        with open(output_json_path, "w") as f:
+            json.dump(output, f, indent=2)
 
-        logger.info(f"Quantified inflam_cells in {output['total_tubules']} tubules")
-
+        logger.info(f"Saved structured summary to {output_json_path}")
         return output
 
-
-    def run_stage4(self, stage2_result: Dict[str, Any]) -> Dict[str, Any]:
+    def run_stage4(self, wsi_path) -> dict:
         from grading.banff_grade import calculate_tubulitis_score
-        # compute the final Banff grading for the tubulitis score
+        import pandas as pd
+
         logger = logging.getLogger(__name__)
-        logger.info(f"Running Stage 3: Grading for {stage2_result['wsi_name']}")
+        logger.info("Running Stage 4: Grading")
+
+        if not wsi_path:
+            raise ValueError("wsi_path must be provided to locate Stage 3 output")
+
+        wsi_name = Path(wsi_path).stem
+        counts_csv_path = self.quantification_dir / f"{wsi_name}_tubule_counts.csv"
+
+        if not counts_csv_path.exists():
+            raise FileNotFoundError(f"Expected counts CSV not found: {counts_csv_path}")
+
+        # Load the per-tubule DataFrame
+        counts_df = pd.read_csv(counts_csv_path)
+
+        # Calculate score using loaded counts
+        grading_result = calculate_tubulitis_score(
+            counts_df=counts_df,
+            output_dir=self.grading_dir
+        )
+
+        return {
+            "wsi_name": wsi_name,
+            "tubulitis_score": grading_result["score"],
+            "grading_report": grading_result["report_path"]
+        }
         
-        try:
-            grading_result = calculate_tubulitis_score(
-                cell_coordinates=stage2_result["cell_coordinates"],
-                tubule_mask=stage2_result["tubule_mask"],
-                foci_mask=stage2_result["foci_mask"],
-                output_dir=self.grading_dir
-            )
-            
-            return {
-                **stage2_result,
-                "tubulitis_score": grading_result["score"],
-                "grading_report": grading_result["report_path"]
-            }
-        except Exception as e:
-            logger.error(f"Grading stage failed: {str(e)}", exc_info=True)
-            raise
-    
     def run_pipeline(self, wsi_path: str) -> Dict[str, Any]:
         # run the entire pipeline, comprising segmentation, quantification and grading
         # pass in an WSI, and get back a dictionary containing results from all stages
@@ -157,10 +205,10 @@ class KidneyGraderPipeline:
         logger.info(f"Starting pipeline for {wsi_path}")
         
         try:
-            stage1_result = self.run_stage1(wsi_path)
-            stage2_result = self.run_stage2(stage1_result)
-            stage3_result = self.run_stage3(stage2_result)
-            final_result = self.run_stage4(stage3_result)
+            self.run_stage1(wsi_path)
+            self.run_stage2(wsi_path)
+            self.run_stage3(wsi_path)
+            final_result = self.run_stage4(wsi_path)
             
             logger.info(f"Pipeline completed successfully for {wsi_path}")
             return final_result
@@ -204,26 +252,23 @@ def main():
         )
         wsi_path = args.input_path
 
-        if stage == "1":
+        if stage == "1": # run segmentation only
             pipeline.run_stage1(wsi_path)
 
         elif stage == "2":
-            # directly run stage 2 with only WSI path
-            stage2_result = pipeline.run_stage2({
-                "wsi_name": Path(wsi_path).stem,
-                "wsi_path": wsi_path
-            })
+            # can run stage 2 independent of stage 1 to test the detection model
+            stage2_result = pipeline.run_stage2(wsi_path)
         # TODO fix logic for this or change to error for stage == 3 and 4
         elif stage == "3":
-            stage1_result = pipeline.run_stage1(wsi_path)
-            stage2_result = pipeline.run_stage2(stage1_result)
-            pipeline.run_stage3(stage1_result, stage2_result)
+            # stage1_result = pipeline.run_stage1(wsi_path)
+            # stage2_result = pipeline.run_stage2(wsi_path)
+            pipeline.run_stage3(wsi_path)
 
         elif stage == "4":
-            stage1_result = pipeline.run_stage1(wsi_path)
-            stage2_result = pipeline.run_stage2(stage1_result)
-            stage3_result = pipeline.run_stage3(stage1_result, stage2_result)
-            pipeline.run_stage4(stage3_result)
+            # stage1_result = pipeline.run_stage1(wsi_path)
+            # stage2_result = pipeline.run_stage2(wsi_path)
+            # stage3_result = pipeline.run_stage3(stage1_result, stage2_result)
+            pipeline.run_stage4(wsi_path)
 
         else:  # default: all
             pipeline.run_pipeline(wsi_path)

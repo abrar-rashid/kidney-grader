@@ -1,16 +1,17 @@
-import os
+import gc
 import logging
 from pathlib import Path
 import numpy as np
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 from tqdm import tqdm
+import json
 import torch
 import cv2
 from torch.utils.data import DataLoader
 from matplotlib import cm
 import tifffile
 from tiffslide import TiffSlide
-
 from .utils import (
     extract_patches_from_wsi,
     load_all_patches_in_folder,
@@ -50,7 +51,6 @@ def process_wsi(wsi_path, model, device, output_dir):
     patch_dir = Path(output_dir) / "patches"
     slide_map_path = patch_dir / "slide_map.json"
 
-    import json
     if slide_map_path.exists():
         logging.info(f"Using existing patches and slide map from: {patch_dir}")
         with open(slide_map_path, "r") as f:
@@ -72,42 +72,43 @@ def process_wsi(wsi_path, model, device, output_dir):
     if len(dataset) == 0:
         raise RuntimeError("No valid tissue patches found.")
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=False)
-    predictions = []
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
+
     valid_indices = [i for i, flag in inference_flags.items() if flag]
-    valid_images_iter = iter(loader)
-
+    valid_idx_set = set(valid_indices)
+    
     logging.info(f"{len(valid_indices)} patches selected for inference out of {len(slide_map)} total patches")
-
-    for i in tqdm(range(len(slide_map)), desc="Running inference on patches"):
-        if i in valid_indices:
-            img = next(valid_images_iter)
-            with torch.no_grad():
-                outputs = model(img.to(device))
-                outputs = outputs[0] if isinstance(outputs, tuple) else outputs
-                probs = torch.softmax(outputs, dim=1).squeeze().cpu().numpy()
-                predictions.append(probs)
-        else:
-            dummy = np.zeros((NUM_CLASSES, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
-            predictions.append(dummy)
-    torch.cuda.empty_cache()
-    # need 1:1 alignment between preds and masks
-    assert len(predictions) == len(slide_map), \
-        f"Mismatch: {len(predictions)} predictions vs {len(slide_map)} patches"
 
     max_x = max(x + w for x, y, w, h in slide_map.values())
     max_y = max(y + h for x, y, w, h in slide_map.values())
-    return post_process_predictions(predictions, slide_map, (max_y, max_x))
+    memmap_path = Path(output_dir) / "full_mask_memmap.dat"
+    full_mask = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(max_y, max_x))
+
+    for i, img in tqdm(enumerate(loader), total=len(slide_map), desc="Running inference on patches"):
+        if i in valid_idx_set:
+            with torch.no_grad():
+                outputs = model(img.to(device))
+                outputs = outputs[0] if isinstance(outputs, tuple) else outputs
+                pred_class = torch.argmax(outputs.squeeze(), dim=0).cpu().numpy()
+
+                x, y, w, h = slide_map[i]
+                full_mask[y:y+h, x:x+w] = pred_class
+        if i % 500 == 0:
+            torch.cuda.empty_cache()
+
+    torch.cuda.empty_cache()
+    return full_mask
 
 
-def save_results(full_mask, wsi_name, output_dir, original_path=None):
+def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=False):
     # Save segmentation results and visualizations.
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
     
-    # save raw mask
-    full_mask_npy_path = output_dir / f"{wsi_name}_full_mask.npy"
-    np.save(full_mask_npy_path, full_mask)
+    print("Saving semantic mask")
+    # save raw semantic mask
+    semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
+    np.save(semantic_mask_npy_path, np.array(full_mask))
     
     # save instance masks for each class
     instance_mask_paths = {}
@@ -120,54 +121,63 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None):
         instance_mask_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.npy"
         np.save(instance_mask_path, instance_mask)
         instance_mask_paths[class_idx] = str(instance_mask_path)
+
+        if visualise: 
+            print("Visualizing instance mask for class", class_idx)
+            instance_mask_normalized = (instance_mask.astype(np.float32) / instance_mask.max()) if instance_mask.max() > 0 else instance_mask
+            cmap = cm.get_cmap('nipy_spectral', instance_mask.max() + 1)
+            instance_mask_colored = (cmap(instance_mask_normalized)[:, :, :3] * 255).astype(np.uint8)
+            
+            print("Saving colored instance mask for class", class_idx)
+            instance_png_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.png"
+            Image.fromarray(instance_mask_colored).save(instance_png_path)
+            
+            print("Saving instance mask as TIFF for class", class_idx)
+            downsample_factor = 4
+            h, w = instance_mask_colored.shape[:2]
+            resized_mask = Image.fromarray(instance_mask_colored).resize(
+                (w // downsample_factor, h // downsample_factor), resample=Image.BILINEAR
+            )
+            instance_colored_tiff_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff"
+            resized_mask = cv2.resize(instance_mask_colored, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_LINEAR)
+            tifffile.imwrite(instance_colored_tiff_path, resized_mask, photometric='rgb')
         
-        print("Visualizing instance mask for class", class_idx)
-        instance_mask_normalized = (instance_mask.astype(np.float32) / instance_mask.max()) if instance_mask.max() > 0 else instance_mask
-        cmap = cm.get_cmap('nipy_spectral', instance_mask.max() + 1)
-        instance_mask_colored = (cmap(instance_mask_normalized)[:, :, :3] * 255).astype(np.uint8)
-        
-        print("Saving colored instance mask for class", class_idx)
-        instance_png_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.png"
-        Image.fromarray(instance_mask_colored).save(instance_png_path)
-        
-        print("Saving instance mask as TIFF for class", class_idx)
-        downsample_factor = 4
-        h, w = instance_mask_colored.shape[:2]
-        resized_mask = Image.fromarray(instance_mask_colored).resize(
-            (w // downsample_factor, h // downsample_factor), resample=Image.BILINEAR
-        )
-        instance_colored_tiff_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff"
-        resized_mask = cv2.resize(instance_mask_colored, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_LINEAR)
-        tifffile.imwrite(instance_colored_tiff_path, resized_mask, photometric='rgb')
+        del instance_mask
+        gc.collect()
 
-
-
-    # Save color-coded mask 
-    colour_mask = create_visualization(full_mask)
-    full_mask_path = output_dir / f"{wsi_name}_full_mask.png"
-    colour_mask.save(full_mask_path)
-
-    # Save overlay if original image is available
-    if original_path:
-        if str(original_path).lower().endswith(('.png', '.jpg', '.jpeg')):
-            original = Image.open(original_path).convert("RGB")
-        else:
-            slide = TiffSlide(original_path)
-            original = slide.get_thumbnail((colour_mask.width, colour_mask.height)).convert("RGB").resize(colour_mask.size)
-            full_mask_tiff_path = output_dir / f"{wsi_name}_full_mask.tiff"
-            tifffile.imwrite(full_mask_tiff_path, np.array(colour_mask).astype(np.uint8))
-
-        overlay = create_visualization(full_mask, original, alpha=0.4)
-        overlay.save(output_dir / f"{wsi_name}_overlay.png")
-
-    return {
-        "mask_path": str(full_mask_path),
-        "mask_npy_path": str(full_mask_npy_path),
+    result = {
+        "semantic_mask_npy_path": str(semantic_mask_npy_path),
         "instance_mask_paths": instance_mask_paths
     }
 
+    if visualise:
+        # Save color-coded mask 
+        colour_mask = create_visualization(full_mask)
+        semantic_mask_png_path = output_dir / f"{wsi_name}_semantic_mask.png"
+        colour_mask.save(semantic_mask_png_path)
+        result["semantic_mask_png_path"] = str(semantic_mask_png_path)
 
-def run_segment(in_path, model_path=DEFAULT_SEGMENTATION_MODEL_PATH, output_dir=SEGMENTATION_OUTPUT_DIR):
+        # Save overlay if original image is available
+        if original_path:
+            if str(original_path).lower().endswith(('.png', '.jpg', '.jpeg')):
+                original = Image.open(original_path).convert("RGB")
+            else:
+                slide = TiffSlide(original_path)
+                original = slide.get_thumbnail((colour_mask.width, colour_mask.height)).convert("RGB").resize(colour_mask.size)
+                full_mask_tiff_path = output_dir / f"{wsi_name}_full_mask.tiff"
+                tifffile.imwrite(full_mask_tiff_path, np.array(colour_mask).astype(np.uint8))
+
+            overlay = create_visualization(full_mask, original, alpha=0.4)
+            overlay.save(output_dir / f"{wsi_name}_overlay.png")
+
+    del full_mask
+    gc.collect()
+
+    return result
+
+
+def run_segment(in_path, model_path=DEFAULT_SEGMENTATION_MODEL_PATH,
+                output_dir=SEGMENTATION_OUTPUT_DIR, visualise=False):
     # Entry function to run segmentation on WSI or regular image.
     wsi_name = Path(in_path).stem
     output_dir = Path(output_dir) / wsi_name
@@ -184,7 +194,7 @@ def run_segment(in_path, model_path=DEFAULT_SEGMENTATION_MODEL_PATH, output_dir=
     else:
         raise ValueError("Unsupported input format")
 
-    return save_results(full_mask, wsi_name, output_dir, in_path)
+    return save_results(full_mask, wsi_name, output_dir, in_path, visualise)
 
 
 if __name__ == "__main__":

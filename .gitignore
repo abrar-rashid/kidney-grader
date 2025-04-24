@@ -22,6 +22,7 @@ checkpoints/
 
 output/
 outputdir/
+output_dir/
 res/
 segmentation/outputs/
 quantification/outputs/

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import numpy as np
 import time
+import cv2
 from rich.console import Console
 from rich.progress import Progress
 from grading.banff_grade import calculate_tubulitis_score
@@ -81,7 +82,7 @@ class KidneyGraderPipeline:
                 "instance_mask_paths": instance_mask_paths
             }
 
-        result = run_segment(wsi_path, output_dir=self.segmentation_dir, model_path=self.model_path, visualise=False)
+        result = run_segment(wsi_path, output_dir=self.segmentation_dir, model_path=self.model_path, visualise=visualise)
         return result
 
     def run_stage2(self, wsi_path, force: bool = False) -> dict:
@@ -127,6 +128,20 @@ class KidneyGraderPipeline:
             raise FileNotFoundError("Required masks from Stage 1 or 2 not found.")
         tubule_mask = np.load(paths["tubule_mask"])
         inflam_cell_mask = np.load(paths["inflam_cell_mask"])
+
+        from tiffslide import TiffSlide
+        self.logger.info(f"[Stage 3] WSI name: {paths['wsi_name']}")
+        slide = TiffSlide(wsi_path)
+        self.logger.info(f"[Stage 3] Original WSI size (level 0): {slide.dimensions}")
+        self.logger.info(f"[Stage 3] Tubule mask shape: {tubule_mask.shape}")
+        self.logger.info(f"[Stage 3] Inflammatory cell mask shape: {inflam_cell_mask.shape}")
+
+        if tubule_mask.shape != inflam_cell_mask.shape:
+            tubule_mask = cv2.resize(
+                tubule_mask.astype(np.uint16),
+                (inflam_cell_mask.shape[1], inflam_cell_mask.shape[0]),
+                interpolation=cv2.INTER_NEAREST
+            )
 
         foci_mask = identify_foci(tubule_mask, min_distance=100)
         cell_coords = np.argwhere(inflam_cell_mask > 0)

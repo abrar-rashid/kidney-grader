@@ -23,6 +23,11 @@ checkpoints/
 output/
 outputdir/
 output_dir/
+new_output/
+out_fix_patching/
+outdir/
+newnewdir/
+outout/
 res/
 segmentation/outputs/
 quantification/outputs/

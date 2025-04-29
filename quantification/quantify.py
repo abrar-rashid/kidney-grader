@@ -13,6 +13,11 @@ def count_cells_in_tubules(nuclei_coords, instance_mask, foci_mask):
     nuclei_coords = nuclei_coords.astype(int)
     nuclei_y, nuclei_x = nuclei_coords[:, 0], nuclei_coords[:, 1]
 
+    h, w = instance_mask.shape
+    valid_mask = (nuclei_y >= 0) & (nuclei_y < h) & (nuclei_x >= 0) & (nuclei_x < w)
+    nuclei_y = nuclei_y[valid_mask]
+    nuclei_x = nuclei_x[valid_mask]
+
     # get tubule label for each nucleus
     tubule_ids = instance_mask[nuclei_y, nuclei_x]
     valid_mask = tubule_ids > 0

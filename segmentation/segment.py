@@ -62,38 +62,41 @@ def process_wsi(wsi_path, model, device, output_dir):
         else:
             inference_flags = {i: True for i in slide_map.keys()}
     else:
-        slide_map, inference_flags = extract_patches_from_wsi(wsi_path, patch_dir)
-        with open(patch_dir / "slide_map.json", "w") as f:
+        slide_map, inference_flags = extract_patches_from_wsi(wsi_path, patch_dir, tissue_filtering=True)
+        with open(slide_map_path, "w") as f:
             json.dump({str(k): list(v) for k, v in slide_map.items()}, f, indent=2)
         with open(patch_dir / "inference_flags.json", "w") as f:
             json.dump({str(k): bool(v) for k, v in inference_flags.items()}, f, indent=2)
 
+    valid_slide_indices = [i for i, flag in inference_flags.items() if flag]
+    if not valid_slide_indices:
+        raise RuntimeError("No valid tissue patches found for inference.")
+
     dataset = load_all_patches_in_folder(patch_dir)
-    if len(dataset) == 0:
-        raise RuntimeError("No valid tissue patches found.")
+    foreground_dataset = torch.utils.data.Subset(dataset, list(range(len(valid_slide_indices))))
+    loader = DataLoader(foreground_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
+    dataloader_to_slide_index = {i: slide_idx for i, slide_idx in enumerate(valid_slide_indices)}
 
-    valid_indices = [i for i, flag in inference_flags.items() if flag]
-    valid_idx_set = set(valid_indices)
-    
-    logging.info(f"{len(valid_indices)} patches selected for inference out of {len(slide_map)} total patches")
+    logging.info(f"{len(valid_slide_indices)} foreground patches selected for inference out of {len(slide_map)} total patches")
 
     max_x = max(x + w for x, y, w, h in slide_map.values())
     max_y = max(y + h for x, y, w, h in slide_map.values())
     memmap_path = Path(output_dir) / "full_mask_memmap.dat"
     full_mask = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(max_y, max_x))
+    full_mask[:] = 0
 
-    for i, img in tqdm(enumerate(loader), total=len(slide_map), desc="Running inference on patches"):
-        if i in valid_idx_set:
-            with torch.no_grad():
-                outputs = model(img.to(device))
-                outputs = outputs[0] if isinstance(outputs, tuple) else outputs
-                pred_class = torch.argmax(outputs.squeeze(), dim=0).cpu().numpy()
+    for j, img in tqdm(enumerate(loader), total=len(foreground_dataset), desc="Running inference on patches"):
+        slide_index = dataloader_to_slide_index[j]
+        x, y, w, h = slide_map[slide_index]
 
-                x, y, w, h = slide_map[i]
-                full_mask[y:y+h, x:x+w] = pred_class
-        if i % 500 == 0:
+        with torch.no_grad():
+            outputs = model(img.to(device))
+            outputs = outputs[0] if isinstance(outputs, tuple) else outputs
+            pred_class = torch.argmax(outputs.squeeze(), dim=0).cpu().numpy()
+            full_mask[y:y+h, x:x+w] = pred_class
+
+        if j % 500 == 0:
             torch.cuda.empty_cache()
 
     torch.cuda.empty_cache()
@@ -109,6 +112,11 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
     # save raw semantic mask
     semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
     np.save(semantic_mask_npy_path, np.array(full_mask))
+
+    print("Saving tissue mask")
+    tissue_mask = (full_mask > 0).astype(np.uint8) * 255
+    tissue_mask_path = output_dir / f"{wsi_name}_tissue_mask.tif"
+    tifffile.imwrite(tissue_mask_path, tissue_mask)
     
     # save instance masks for each class
     instance_mask_paths = {}
@@ -125,7 +133,12 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
         if visualise: 
             print("Visualizing instance mask for class", class_idx)
             instance_mask_normalized = (instance_mask.astype(np.float32) / instance_mask.max()) if instance_mask.max() > 0 else instance_mask
-            cmap = cm.get_cmap('nipy_spectral', instance_mask.max() + 1)
+            downsample_factor = 4
+            h, w = instance_mask.shape
+            small_mask = cv2.resize(instance_mask, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_NEAREST)
+
+            instance_mask_normalized = (small_mask.astype(np.float32) / small_mask.max()) if small_mask.max() > 0 else small_mask
+            cmap = cm.get_cmap('nipy_spectral', small_mask.max() + 1)
             instance_mask_colored = (cmap(instance_mask_normalized)[:, :, :3] * 255).astype(np.uint8)
             
             print("Saving colored instance mask for class", class_idx)
@@ -135,9 +148,6 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
             print("Saving instance mask as TIFF for class", class_idx)
             downsample_factor = 4
             h, w = instance_mask_colored.shape[:2]
-            resized_mask = Image.fromarray(instance_mask_colored).resize(
-                (w // downsample_factor, h // downsample_factor), resample=Image.BILINEAR
-            )
             instance_colored_tiff_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff"
             resized_mask = cv2.resize(instance_mask_colored, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_LINEAR)
             tifffile.imwrite(instance_colored_tiff_path, resized_mask, photometric='rgb')

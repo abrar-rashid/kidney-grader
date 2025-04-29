@@ -1,136 +1,204 @@
-# detection/instseg_infer.py
-
 import os
-from matplotlib import pyplot as plt
+import cv2
+import json
 import numpy as np
-from tqdm import tqdm
 import torch
-import time
-import tifffile
-from tiffslide import TiffSlide
 from pathlib import Path
-from instanseg import InstanSeg
 from skimage.measure import label as sklabel
-from instanseg.utils.pytorch_utils import torch_fastremap, centroids_from_lab, get_masked_patches, _to_tensor_float32
+from tqdm import tqdm
+from tiffslide import TiffSlide
+import tifffile
+
+from instanseg import InstanSeg
+from instanseg.utils.pytorch_utils import _to_tensor_float32, torch_fastremap, centroids_from_lab, get_masked_patches
 from instanseg.inference_class import _rescale_to_pixel_size
-
-# Setup
-MODEL_DIR = "detection/models"
-INSTANSEG_MODEL = "instanseg_brightfield_monkey.pt"
-CLASSIFIER_MODELS = ["1952372.pt", "1950672.pt", "1949389_2.pt"]
-DEST_PIXEL_SIZE = 0.5
-PATCH_SIZE = 128
-
-
-class InflammatoryCellDetector:
-    def __init__(self, instanseg_model_path, classifier_model_paths, device="cuda"):
-        self.device = device
-        self.inst_model = torch.jit.load(instanseg_model_path).to(device).eval()
-        self.detector = InstanSeg(self.inst_model, verbosity=0)
-
-        self.classifier = torch.nn.ModuleList([
-            torch.jit.load(p).to(device).eval() for p in classifier_model_paths
-        ])
-
-    def classify_batch(self, x, batch_size=128):
-        preds_all = []
-
-        with torch.no_grad(), torch.amp.autocast("cuda"):
-            for i in tqdm(range(0, len(x), batch_size), desc="Classifying cells", unit="batch"):
-                xb = x[i:i+batch_size].float()
-                preds = [m(xb) for m in self.classifier]
-                pred = torch.stack(preds).mean(0)
-                preds_all.append(pred)
-
-        y_hat = torch.cat(preds_all, dim=0)
-        return y_hat.softmax(1).argmax(1)
-
-    def detect(self, img_array, mask_array):
-        start_time = time.time()
-        with torch.no_grad():
-            t0 = time.time()
-            labels, _ = self.detector.eval_medium_image(
-                img_array,
-                pixel_size=0.242,
-                rescale_output=True,
-                seed_threshold=0.1,
-                tile_size=1024
-            )
-            print(f"[timing] segmentation: {time.time() - t0:.2f}s")
-
-            img_tensor = _to_tensor_float32(img_array).to(self.device, non_blocking=True)
-            mask_tensor = _to_tensor_float32(mask_array).to(self.device, non_blocking=True)
-
-            labels = labels * mask_tensor.bool().cpu()
-            labels = torch_fastremap(labels)
-
-            t1 = time.time()
-            crops, masks = get_masked_patches(labels, img_tensor.cpu(), patch_size=PATCH_SIZE)
-
-            x_cpu = torch.cat((crops / 255.0, masks), dim=1).pin_memory()
-            x_gpu = x_cpu.to(self.device, non_blocking=True)
-            print(f"[timing] patch extraction: {time.time() - t1:.2f}s")
-
-            torch.cuda.empty_cache()
-
-            t2 = time.time()
-            y_hat = self.classify_batch(x_gpu)
-            print(f"[timing] classification: {time.time() - t2:.2f}s")
-
-            coords = centroids_from_lab(labels)[0].cpu().numpy()
-            inflam_cell_coords = coords[y_hat.cpu().numpy() == 1]
-
-        elapsed_time = time.time() - start_time
-        print(f"[INFO] detect() completed in {elapsed_time:.2f} seconds")
-
-        return inflam_cell_coords, labels, y_hat
+import ttach as tta
 
 
 def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path: str) -> np.ndarray:
-    import cv2
-
-    output_dir = Path(output_dir)
+    wsi_path = Path(wsi_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    slide = TiffSlide(wsi_path)
-    image = slide.read_region((0, 0), level=0, size=slide.dimensions, as_array=True)
-    mask = np.ones_like(image[..., 0], dtype=np.uint8)  # Use full image as dummy mask
+    segmentation_dir = output_dir.parent.parent / "segmentation" / wsi_path.stem
+    tissue_mask_path = segmentation_dir / f"{wsi_path.stem}_tissue_mask.tif"
 
-    detector = InflammatoryCellDetector(
-        instanseg_model_path=os.path.join(model_path, INSTANSEG_MODEL),
-        classifier_model_paths=[os.path.join(model_path, ckpt) for ckpt in CLASSIFIER_MODELS],
-    )
+    if not tissue_mask_path.exists():
+        raise FileNotFoundError(f"Tissue mask not found at: {tissue_mask_path}")
 
-    print("Running detection of inflammatory cells with instanseg...")
-    coords, _, _ = detector.detect(image, mask)
+    instanseg_model = Path(model_path) / "instanseg_brightfield_monkey.pt"
+    classifier_model_paths = [
+        Path(model_path) / "1952372.pt",
+        Path(model_path) / "1950672.pt",
+        Path(model_path) / "1949389_2.pt"
+    ]
 
-    # create instance mask with unique labels
-    inflam_cell_mask = np.zeros(image.shape[:2], dtype=np.uint16)
-    for idx, (y, x) in enumerate(coords.astype(int)):
-        if 0 <= y < inflam_cell_mask.shape[0] and 0 <= x < inflam_cell_mask.shape[1]:
-            inflam_cell_mask[y, x] = idx + 1
+    destination_pixel_size = 0.5
+    rescale_output = destination_pixel_size != 0.5
+    patch_size = 128
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_tta = True
 
-    np.save(output_dir / "inflam_cell_instance_mask.npy", inflam_cell_mask)
+    class ModelEnsemble(torch.nn.Module):
+        def __init__(self, model_paths, device, use_tta=False):
+            super().__init__()
+            self.models = torch.nn.ModuleList([
+                self.load_model(path, device, use_tta) for path in model_paths
+            ])
 
-    # Create RGB colormapped mask
-    normalized_mask = (inflam_cell_mask.astype(np.float32) / inflam_cell_mask.max()) if inflam_cell_mask.max() > 0 else inflam_cell_mask
-    rgb_mask = (plt.cm.tab20(normalized_mask)[..., :3] * 255).astype(np.uint8)
-    tifffile.imwrite(output_dir / "inflam_cell_instance_mask.tiff", rgb_mask, photometric="rgb")
+        def load_model(self, path, device, use_tta):
+            model = torch.jit.load(str(path)).eval().to(device)
+            if use_tta:
+                transforms = tta.Compose([
+                    tta.VerticalFlip(),
+                    tta.Rotate90([0, 90, 180, 270])
+                ])
+                model = tta.ClassificationTTAWrapper(model, transforms, merge_mode='mean')
+            return model
 
-    # Overlay points on WSI (green dots)
-    overlay_points = image[..., :3].copy()
-    if overlay_points.dtype != np.uint8:
-        overlay_points = (overlay_points / overlay_points.max() * 255).astype(np.uint8)
+        def forward(self, x):
+            with torch.no_grad():
+                preds = [model(x) for model in self.models]
+                return torch.mean(torch.stack(preds), dim=0)
 
-    for (y, x) in coords.astype(int):
-        cv2.circle(overlay_points, (x, y), radius=4, color=(0, 255, 0), thickness=-1)
+    instanseg_script = torch.jit.load(instanseg_model).to(device)
+    instanseg = InstanSeg(instanseg_script, verbosity=0)
+    classifier = ModelEnsemble(classifier_model_paths, device=device, use_tta=use_tta)
 
-    tifffile.imwrite(output_dir / "wsi_with_inflam_overlay.tiff", overlay_points, photometric="rgb")
+    slide = TiffSlide(str(wsi_path))
+    mask_slide = TiffSlide(str(tissue_mask_path))
 
-    # Optional: Blended version of RGB mask + WSI
-    alpha = 0.5
-    blended = cv2.addWeighted(overlay_points, 1 - alpha, rgb_mask, alpha, 0)
-    tifffile.imwrite(output_dir / "wsi_with_mask_blend.tiff", blended, photometric="rgb")
+    mask_full = mask_slide.read_region((0, 0), 0, size=mask_slide.dimensions, as_array=True)
+    downsample_factor = 8
+    H, W = mask_full.shape[:2]
+    mask_thumb = cv2.resize(mask_full, (W // downsample_factor, H // downsample_factor), interpolation=cv2.INTER_NEAREST)
+    factor = downsample_factor
 
-    return inflam_cell_mask
+    mask_labels = sklabel(mask_thumb > 0)
 
+    all_coords = []
+    all_confidences = []
+    inflammatory_mask = None
+    current_id = 1
+
+    for i in range(1, mask_labels.max() + 1):
+        mask = mask_labels == i
+        bbox = np.argwhere(mask)
+        bbox_min, bbox_max = bbox.min(0), bbox.max(0)
+        bbox_scaled = (bbox_min * factor).astype(int), (bbox_max * factor).astype(int)
+
+        x0, y0 = bbox_scaled[0][1], bbox_scaled[0][0]
+        x1, y1 = bbox_scaled[1][1], bbox_scaled[1][0]
+        width, height = x1 - x0, y1 - y0
+
+        image = slide.read_region((x0, y0), 0, (width, height), as_array=True)
+        mask_full = mask_slide.read_region((x0, y0), 0, (width, height), as_array=True)
+
+        H_img, W_img = image.shape[:2]
+
+        # Skip very small ROIs
+        if H_img < 128 or W_img < 128:
+            print(f"Skipping tiny ROI {i} with size {image.shape}, smaller than 128x128")
+            continue
+
+        # Pad if necessary for eval_medium_image
+        min_size_for_eval = 512
+        pad_h = max(0, min_size_for_eval - H_img)
+        pad_w = max(0, min_size_for_eval - W_img)
+        if pad_h > 0 or pad_w > 0:
+            print(f"Padding ROI {i} from ({H_img}, {W_img}) to ({H_img + pad_h}, {W_img + pad_w})")
+            image = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
+            mask_full = np.pad(mask_full, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+
+        labels, _ = instanseg.eval_medium_image(
+            image,
+            pixel_size=0.24199951445730394,
+            rescale_output=rescale_output,
+            tile_size=1024
+        )
+
+        tensor = _rescale_to_pixel_size(_to_tensor_float32(image), 0.24199951445730394, destination_pixel_size).to("cpu")
+        mask = _rescale_to_pixel_size(_to_tensor_float32(mask_full), 0.24199951445730394, destination_pixel_size).to("cpu")
+        labels = labels.to("cpu") * torch.tensor(mask).bool()
+        labels = torch_fastremap(labels)
+
+        crops, masks = get_masked_patches(labels, tensor, patch_size=patch_size)
+        x = torch.cat((crops / 255.0, masks), dim=1)
+
+        with torch.amp.autocast("cuda" if device == "cuda" else "cpu"):
+            with torch.no_grad():
+                y_hat = torch.cat([
+                    classifier(x[i:i+128].float().to(device)) for i in range(0, len(x), 128)
+                ], dim=0).cpu()
+                conf = y_hat.softmax(1).numpy()
+                y_classes = y_hat.argmax(1).numpy()
+
+        coords = centroids_from_lab(labels.squeeze(0) if labels.ndim == 3 else labels)[0].cpu().numpy()
+        coords = coords[:, ::-1] * (destination_pixel_size / 0.24199951445730394)
+        coords += np.array([x0, y0])
+
+        is_inflam = np.isin(y_classes, [0, 1])
+        coords_inflam = coords[is_inflam]
+        conf_inflam = conf[is_inflam]
+
+        all_coords.extend(coords_inflam)
+        all_confidences.extend(conf_inflam)
+
+        labels_np = labels.cpu().numpy()
+        inflam_indices = np.where(np.isin(y_classes, [0, 1]))[0]
+        selected_labels = inflam_indices + 1
+
+        instance_mask = np.zeros_like(labels_np, dtype=np.uint16)
+
+        for lbl in selected_labels:
+            instance_mask[labels_np == lbl] = current_id
+            current_id += 1
+
+        if inflammatory_mask is None:
+            H, W = mask_slide.dimensions
+            inflammatory_mask = np.zeros((H, W), dtype=np.uint16)
+
+        H, W = inflammatory_mask.shape
+
+        instance_mask = np.squeeze(instance_mask)
+        assert instance_mask.ndim == 2
+        h, w = instance_mask.shape
+
+        y1 = min(y0 + h, H)
+        x1 = min(x0 + w, W)
+
+        yy = slice(y0, y1)
+        xx = slice(x0, x1)
+
+        # Crop instance_mask to match the slice (in case it overflows)
+        instance_mask_crop = instance_mask[:(y1 - y0), :(x1 - x0)]
+
+        inflammatory_mask[yy, xx] = np.maximum(inflammatory_mask[yy, xx], instance_mask_crop)
+
+
+    # Save JSON
+    json_path = output_dir / "detected-inflammatory-cells.json"
+    json_data = {
+        "name": "inflammatory-cells",
+        "type": "Multiple points",
+        "version": {"major": 1, "minor": 0},
+        "points": []
+    }
+    for i, ((x, y), conf) in enumerate(zip(all_coords, all_confidences)):
+        json_data["points"].append({
+            "name": f"Point {i}",
+            "point": [x * 0.24199951445730394 / 1000, y * 0.24199951445730394 / 1000, 0.24199951445730394],
+            "probability": float(conf[0] + conf[1])
+        })
+
+    with open(json_path, "w") as f:
+        json.dump(json_data, f, indent=2)
+    print(f"Saved JSON: {json_path}")
+
+    # Save instance mask
+    npy_path = output_dir / "inflam_cell_instance_mask.npy"
+    tif_path = output_dir / "inflam_cell_instance_mask.tiff"
+    np.save(npy_path, inflammatory_mask)
+    tifffile.imwrite(tif_path, inflammatory_mask.astype(np.uint16))
+    print(f"Saved instance mask: {npy_path}, {tif_path}")
+
+    return inflammatory_mask

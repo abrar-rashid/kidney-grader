@@ -13,13 +13,13 @@ from matplotlib import cm
 import tifffile
 from tiffslide import TiffSlide
 from .utils import (
-    extract_patches_from_wsi,
     load_all_patches_in_folder,
     create_visualization,
     load_model,
     get_instance_mask
 )
-from .config import DEFAULT_SEGMENTATION_MODEL_PATH, NUM_CLASSES, PATCH_SIZE, SEGMENTATION_OUTPUT_DIR
+from detection.patch_extractor import extract_patches_from_wsi
+from .config import DEFAULT_SEGMENTATION_MODEL_PATH, NUM_CLASSES, PATCH_OVERLAP, PATCH_SIZE, SEGMENTATION_OUTPUT_DIR
 
 
 def post_process_predictions(predictions, slide_map, original_shape):
@@ -47,54 +47,51 @@ def process_regular_image(img_path, model, device):
 
 
 def process_wsi(wsi_path, model, device, output_dir):
-    # process a WSI through model
-    patch_dir = Path(output_dir) / "patches"
-    slide_map_path = patch_dir / "slide_map.json"
+    from torchvision import transforms
 
-    if slide_map_path.exists():
-        logging.info(f"Using existing patches and slide map from: {patch_dir}")
-        with open(slide_map_path, "r") as f:
-            slide_map = {int(k): tuple(v) for k, v in json.load(f).items()}
-        inference_flags_path = patch_dir / "inference_flags.json"
-        if inference_flags_path.exists():
-            with open(inference_flags_path, "r") as f:
-                inference_flags = {int(k): v for k, v in json.load(f).items()}
-        else:
-            inference_flags = {i: True for i in slide_map.keys()}
-    else:
-        slide_map, inference_flags = extract_patches_from_wsi(wsi_path, patch_dir, tissue_filtering=True)
-        with open(slide_map_path, "w") as f:
-            json.dump({str(k): list(v) for k, v in slide_map.items()}, f, indent=2)
-        with open(patch_dir / "inference_flags.json", "w") as f:
-            json.dump({str(k): bool(v) for k, v in inference_flags.items()}, f, indent=2)
+    logging.info(f"Extracting patches from WSI: {wsi_path}")
+    patches = extract_patches_from_wsi(
+        wsi_path=wsi_path,
+        patch_size=PATCH_SIZE,
+        overlap=PATCH_OVERLAP,
+        level=0,
+        tissue_threshold=0.05,
+        create_debug_images=False,
+        debug_output_dir=None,
+        num_patches=float("inf"),
+        extraction_mode="contiguous",
+        save_patches=False,
+        output_dir=None,
+        label=None,
+    )
 
-    valid_slide_indices = [i for i, flag in inference_flags.items() if flag]
-    if not valid_slide_indices:
+    if not patches:
         raise RuntimeError("No valid tissue patches found for inference.")
 
-    dataset = load_all_patches_in_folder(patch_dir)
-    foreground_dataset = torch.utils.data.Subset(dataset, list(range(len(valid_slide_indices))))
-    loader = DataLoader(foreground_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
+    logging.info(f"{len(patches)} tissue patches extracted for inference.")
 
-    dataloader_to_slide_index = {i: slide_idx for i, slide_idx in enumerate(valid_slide_indices)}
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.8, 0.65, 0.8], std=[0.15, 0.15, 0.15])
+    ])
 
-    logging.info(f"{len(valid_slide_indices)} foreground patches selected for inference out of {len(slide_map)} total patches")
+    coords = [(x, y, PATCH_SIZE, PATCH_SIZE) for _, x, y in patches]
+    max_x = max(x + w for x, y, w, h in coords)
+    max_y = max(y + h for x, y, w, h in coords)
 
-    max_x = max(x + w for x, y, w, h in slide_map.values())
-    max_y = max(y + h for x, y, w, h in slide_map.values())
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     memmap_path = Path(output_dir) / "full_mask_memmap.dat"
     full_mask = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(max_y, max_x))
     full_mask[:] = 0
 
-    for j, img in tqdm(enumerate(loader), total=len(foreground_dataset), desc="Running inference on patches"):
-        slide_index = dataloader_to_slide_index[j]
-        x, y, w, h = slide_map[slide_index]
+    for j, (patch_np, x, y) in tqdm(enumerate(patches), total=len(patches), desc="Running inference on patches"):
+        img_tensor = transform(Image.fromarray(patch_np)).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            outputs = model(img.to(device))
+            outputs = model(img_tensor)
             outputs = outputs[0] if isinstance(outputs, tuple) else outputs
             pred_class = torch.argmax(outputs.squeeze(), dim=0).cpu().numpy()
-            full_mask[y:y+h, x:x+w] = pred_class
+            full_mask[y:y+PATCH_SIZE, x:x+PATCH_SIZE] = pred_class
 
         if j % 500 == 0:
             torch.cuda.empty_cache()
@@ -102,83 +99,82 @@ def process_wsi(wsi_path, model, device, output_dir):
     torch.cuda.empty_cache()
     return full_mask
 
-
 def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=False):
     # Save segmentation results and visualizations.
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
-    
-    print("Saving semantic mask")
-    # save raw semantic mask
-    semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
-    np.save(semantic_mask_npy_path, np.array(full_mask))
 
-    print("Saving tissue mask")
-    tissue_mask = (full_mask > 0).astype(np.uint8) * 255
-    tissue_mask_path = output_dir / f"{wsi_name}_tissue_mask.tif"
-    tifffile.imwrite(tissue_mask_path, tissue_mask)
-    
-    # save instance masks for each class
     instance_mask_paths = {}
+
     for class_idx in range(1, NUM_CLASSES):
+        if class_idx in [2, 3]:
+            continue  # skip veins and arteries for now
+
         instance_mask, num_instances = get_instance_mask(full_mask, tissue_type=class_idx)
         if num_instances == 0:
             continue
-        
-        print("Saving instance mask for class", class_idx)
+
+        print(f"Saving instance mask for class {class_idx}")
         instance_mask_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.npy"
         np.save(instance_mask_path, instance_mask)
         instance_mask_paths[class_idx] = str(instance_mask_path)
 
-        if visualise: 
-            print("Visualizing instance mask for class", class_idx)
-            instance_mask_normalized = (instance_mask.astype(np.float32) / instance_mask.max()) if instance_mask.max() > 0 else instance_mask
+        if visualise:
+            print(f"Visualizing instance mask for class {class_idx}")
             downsample_factor = 4
             h, w = instance_mask.shape
             small_mask = cv2.resize(instance_mask, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_NEAREST)
 
-            instance_mask_normalized = (small_mask.astype(np.float32) / small_mask.max()) if small_mask.max() > 0 else small_mask
+            norm_mask = small_mask.astype(np.float32) / small_mask.max() if small_mask.max() > 0 else small_mask
             cmap = cm.get_cmap('nipy_spectral', small_mask.max() + 1)
-            instance_mask_colored = (cmap(instance_mask_normalized)[:, :, :3] * 255).astype(np.uint8)
-            
-            print("Saving colored instance mask for class", class_idx)
-            instance_png_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.png"
-            Image.fromarray(instance_mask_colored).save(instance_png_path)
-            
-            print("Saving instance mask as TIFF for class", class_idx)
-            downsample_factor = 4
-            h, w = instance_mask_colored.shape[:2]
+            instance_mask_colored = (cmap(norm_mask)[:, :, :3] * 255).astype(np.uint8)
+
             instance_colored_tiff_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff"
-            resized_mask = cv2.resize(instance_mask_colored, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_LINEAR)
-            tifffile.imwrite(instance_colored_tiff_path, resized_mask, photometric='rgb')
-        
+            tifffile.imwrite(instance_colored_tiff_path, instance_mask_colored, photometric='rgb')
+
         del instance_mask
         gc.collect()
 
     result = {
-        "semantic_mask_npy_path": str(semantic_mask_npy_path),
         "instance_mask_paths": instance_mask_paths
     }
 
-    if visualise:
-        # Save color-coded mask 
-        colour_mask = create_visualization(full_mask)
-        semantic_mask_png_path = output_dir / f"{wsi_name}_semantic_mask.png"
-        colour_mask.save(semantic_mask_png_path)
-        result["semantic_mask_png_path"] = str(semantic_mask_png_path)
+    memmap_path = Path(output_dir) / "full_mask_memmap.dat"
+    if memmap_path.exists():
+        try:
+            memmap_path.unlink()
+            print(f"Deleted memmap file: {memmap_path}")
+        except Exception as e:
+            print(f"Warning: Could not delete memmap file: {e}")
 
-        # Save overlay if original image is available
-        if original_path:
-            if str(original_path).lower().endswith(('.png', '.jpg', '.jpeg')):
-                original = Image.open(original_path).convert("RGB")
-            else:
-                slide = TiffSlide(original_path)
-                original = slide.get_thumbnail((colour_mask.width, colour_mask.height)).convert("RGB").resize(colour_mask.size)
-                full_mask_tiff_path = output_dir / f"{wsi_name}_full_mask.tiff"
-                tifffile.imwrite(full_mask_tiff_path, np.array(colour_mask).astype(np.uint8))
+    if not visualise:
+        del full_mask
+        gc.collect()
+        return result
 
-            overlay = create_visualization(full_mask, original, alpha=0.4)
-            overlay.save(output_dir / f"{wsi_name}_overlay.png")
+    print("Creating visualization of semantic mask")
+    colour_mask = create_visualization(full_mask)
+    semantic_mask_tiff_path = output_dir / f"{wsi_name}_semantic_mask_colored.tiff"
+    tifffile.imwrite(semantic_mask_tiff_path, np.array(colour_mask), photometric='rgb')
+    result["semantic_mask_colored_tiff_path"] = str(semantic_mask_tiff_path)
+
+    # Optionally save raw semantic mask for debugging
+    semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
+    np.save(semantic_mask_npy_path, np.array(full_mask))
+    result["semantic_mask_npy_path"] = str(semantic_mask_npy_path)
+
+    if original_path:
+        if str(original_path).lower().endswith(('.png', '.jpg', '.jpeg')):
+            original = Image.open(original_path).convert("RGB")
+        else:
+            slide = TiffSlide(original_path)
+            original = slide.get_thumbnail((colour_mask.width, colour_mask.height)).convert("RGB").resize(colour_mask.size)
+
+        print("Saving overlay visualization")
+        overlay = create_visualization(full_mask, original, alpha=0.4)
+        overlay_path = output_dir / f"{wsi_name}_overlay.png"
+        overlay.save(overlay_path)
+        result["overlay_path"] = str(overlay_path)
 
     del full_mask
     gc.collect()

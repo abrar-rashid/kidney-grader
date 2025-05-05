@@ -4,6 +4,8 @@ from pathlib import Path
 import logging
 from tqdm import tqdm
 
+from skimage.measure import regionprops
+
 def count_cells_in_tubules(nuclei_coords, instance_mask, foci_mask):
     # for each tubule, record its cell count, position, and ids of itself and the focus it is assigned to.
 
@@ -31,25 +33,24 @@ def count_cells_in_tubules(nuclei_coords, instance_mask, foci_mask):
 
     # build results
     results = []
-    for tub_id in tqdm(unique_ids, desc="Counting cells in tubules"):
-        tubule_mask = instance_mask == tub_id
-        y_coords, x_coords = np.where(tubule_mask)
-        if len(y_coords) == 0:
-            continue
-        centroid_y = y_coords.mean()
-        centroid_x = x_coords.mean()
-        focus_id = foci_mask[y_coords[0], x_coords[0]]  # can also be refined
 
+    # precompute regionprops only once
+    for region in regionprops(instance_mask):
+        tub_id = region.label
+        if tub_id not in id_to_count:
+            continue
+        y, x = region.centroid
+        focus_id = foci_mask[int(y), int(x)]
         results.append({
             'tubule_id': int(tub_id),
-            'x': centroid_x,
-            'y': centroid_y,
+            'x': x,
+            'y': y,
             'cell_count': int(id_to_count[tub_id]),
             'focus_id': int(focus_id)
         })
 
-    df = pd.DataFrame(results)
-    return df.sort_values("cell_count", ascending=False)
+    return pd.DataFrame(results).sort_values("cell_count", ascending=False)
+
 
 def save_counts_csv(counts_df, output_path): # saves results dataframe into CSV file 
     output_path = Path(output_path)

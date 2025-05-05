@@ -85,78 +85,74 @@ class KidneyGraderPipeline:
         result = run_segment(wsi_path, output_dir=self.segmentation_dir, model_path=self.model_path, visualise=visualise)
         return result
 
-    def run_stage2(self, wsi_path, force: bool = False) -> dict:
+    def run_stage2(self, wsi_path, force: bool = False, visualise: bool = False) -> dict:
         from detection.detect import run_inflammatory_cell_detection
 
         self.logger.info("Running Stage 2: Inflammatory cell detection")
         wsi_name = Path(wsi_path).stem
         output_dir = self.detection_dir / wsi_name
-        mask_path = output_dir / "inflam_cell_instance_mask.npy"
+        mm_coords_path = output_dir / "inflam_cell_mm_coords.npy"
+        pixel_coords_path = output_dir / "inflam_cell_pixel_coords.npy"
 
         output_dir.mkdir(exist_ok=True)
-        
-        if mask_path.exists() and not force:
-            self.logger.info(f"Inflammatory cell mask already exists at {mask_path}, skipping detection.")
-            inflam_cell_mask = np.load(mask_path)
+
+        if mm_coords_path.exists() and not force:
+            self.logger.info(f"Coordinate file already exists at {mm_coords_path}, skipping detection.")
+            mm_coords = np.load(mm_coords_path)
         else:
-            inflam_cell_mask = run_inflammatory_cell_detection(
+            mm_coords = run_inflammatory_cell_detection(
                 wsi_path=wsi_path,
                 output_dir=output_dir,
-                model_path="detection/models"
+                model_path="detection/models/",
+                visualise=visualise
             )
-            np.save(mask_path, inflam_cell_mask)
+            np.save(mm_coords_path, mm_coords)
 
-        self.logger.info(f"Detected {np.unique(inflam_cell_mask).size - 1} inflam_cells")
+        self.logger.info(f"Detected {len(mm_coords)} inflam_cells")
 
         return {
             "wsi_name": wsi_name,
-            "inflam_cell_mask_path": str(mask_path)
+            "inflam_cell_coords_path": str(mm_coords_path),
+            "inflam_cell_pixel_coords_path": str(pixel_coords_path) if pixel_coords_path.exists() else None
         }
-
 
     def run_stage3(self, wsi_path: str, force: bool = False) -> dict:
         self.logger.info("Running Stage 3: Quantification of inflammatory cells per tubule")
-        
+
         paths = self.get_output_paths(wsi_path)
 
         if paths["counts_csv"].exists() and paths["quant_json"].exists() and not force:
             self.logger.info(f"Quantification already exists in {self.quantification_dir}. Skipping.")
             with open(paths["quant_json"]) as f:
                 return json.load(f)
-        
-        if not paths["tubule_mask"].exists() or not paths["inflam_cell_mask"].exists():
-            raise FileNotFoundError("Required masks from Stage 1 or 2 not found.")
+
+        if not paths["tubule_mask"].exists():
+            raise FileNotFoundError("Required tubule mask not found.")
+
         tubule_mask = np.load(paths["tubule_mask"])
-        inflam_cell_mask = np.load(paths["inflam_cell_mask"])
+        coords_path = self.detection_dir / paths["wsi_name"] / "inflam_cell_mm_coords.npy"
+        mm_coords = np.load(coords_path)
+
+        # Convert mm → pixel coordinates
+        MICRONS_PER_PIXEL = 0.24199951445730394
+        cell_coords = (mm_coords * 1000 / MICRONS_PER_PIXEL).astype(np.int32)
 
         from tiffslide import TiffSlide
-        self.logger.info(f"[Stage 3] WSI name: {paths['wsi_name']}")
         slide = TiffSlide(wsi_path)
-        self.logger.info(f"[Stage 3] Original WSI size (level 0): {slide.dimensions}")
+        self.logger.info(f"[Stage 3] WSI name: {paths['wsi_name']}")
+        self.logger.info(f"[Stage 3] WSI size: {slide.dimensions}")
         self.logger.info(f"[Stage 3] Tubule mask shape: {tubule_mask.shape}")
-        self.logger.info(f"[Stage 3] Inflammatory cell mask shape: {inflam_cell_mask.shape}")
-
-        if tubule_mask.shape != inflam_cell_mask.shape:
-            tubule_mask = cv2.resize(
-                tubule_mask.astype(np.uint16),
-                (inflam_cell_mask.shape[1], inflam_cell_mask.shape[0]),
-                interpolation=cv2.INTER_NEAREST
-            )
 
         foci_mask = identify_foci(tubule_mask, min_distance=100)
-        cell_coords = np.argwhere(inflam_cell_mask > 0)
-
         counts_df = count_cells_in_tubules(cell_coords, tubule_mask, foci_mask)
 
-        # save counts CSV but also json
         save_counts_csv(counts_df, paths["counts_csv"])
         summary_stats = analyze_tubule_cell_distribution(counts_df)
-
-        per_tubule_counts = dict(zip(counts_df['tubule_id'], counts_df['cell_count'])) #simpler count dict
+        per_tubule_counts = dict(zip(counts_df['tubule_id'], counts_df['cell_count']))
 
         output = {
             "wsi_name": paths["wsi_name"],
-            "total_inflam_cells": int(len(np.unique(inflam_cell_mask)) - 1),
+            "total_inflam_cells": int(len(cell_coords)),
             "total_tubules": int(len(np.unique(tubule_mask)) - 1),
             "tubule_counts_csv": str(paths["counts_csv"]),
             "per_tubule_inflam_cell_counts": {int(k): int(v) for k, v in per_tubule_counts.items()},
@@ -202,7 +198,7 @@ class KidneyGraderPipeline:
         if stage == "1":
             return self.run_stage1(wsi_path, force=force, visualise=visualise)
         elif stage == "2":
-            return self.run_stage2(wsi_path, force=force)
+            return self.run_stage2(wsi_path, force=force, visualise=visualise)
         elif stage == "3":
             return self.run_stage3(wsi_path, force=force)
         elif stage == "4":
@@ -216,7 +212,7 @@ class KidneyGraderPipeline:
         self.logger.info(f"Starting full pipeline for {wsi_path}")
         self.run_stage1(wsi_path, force=force, visualise=visualise)
         self.logger.info("Stage 1 completed. Proceeding to Stage 2.")
-        self.run_stage2(wsi_path, force=force)
+        self.run_stage2(wsi_path, force=force, visualise=visualise)
         self.logger.info("Stage 2 completed. Proceeding to Stage 3.")
         self.run_stage3(wsi_path, force=force)
         self.logger.info("Stage 3 completed. Proceeding to Stage 4.")

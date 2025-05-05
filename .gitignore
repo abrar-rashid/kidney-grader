@@ -21,14 +21,9 @@ checkpoints/
 *.pt
 
 output/
-outputdir/
-output_dir/
-new_output/
-out_fix_patching/
-outdir/
-newnewdir/
-outout/
-res/
+test_pipeline_correlation_output/
+test_correlation_output/
+.output_segment*
 segmentation/outputs/
 quantification/outputs/
 grading/outputs/
@@ -42,6 +37,7 @@ test/
 *.tiff
 
 # temp/debug
+tmp/
 *.tmp
 *.bak
 *.swp

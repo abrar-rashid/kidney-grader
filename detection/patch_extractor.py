@@ -30,13 +30,13 @@ def is_tissue_patch(patch_np, threshold=0.15):
 
 def extract_patches_from_wsi(
     wsi_path,
-    patch_size=256,
+    patch_size=512,
     overlap=0.25,
     level=0,
     tissue_threshold=0.05,
     create_debug_images=True,
     debug_output_dir=None,
-    num_patches=1000,
+    num_patches=float("inf"),
     exclusion_conditions=None,
     exclusion_mode="any",
     extraction_mode="random",
@@ -266,7 +266,7 @@ def extract_patches_from_wsi(
                 and all(satisfied_conditions)
                 and satisfied_conditions
             ):
-                should_exclude = Trueg
+                should_exclude = True
 
             if should_exclude:
                 if create_debug_images and len(satisfied_conditions) > 0:

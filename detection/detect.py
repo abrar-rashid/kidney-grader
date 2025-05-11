@@ -20,7 +20,7 @@ def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path:
         tissue_threshold=0.05,
         create_debug_images=False,
         debug_output_dir="./tmp/debug",
-        num_patches=1000,
+        num_patches=float("inf"),
         exclusion_conditions=[],
         exclusion_mode="any",
         extraction_mode="contiguous",
@@ -31,9 +31,10 @@ def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path:
 
     bbox_list = []
     for patch_np, x, y in patches:
-        x1, y1 = x, y
-        x2, y2 = x + patch_np.shape[1], y + patch_np.shape[0]
-        bbox_list.extend([x1, y1, x2, y2])
+        if patch_np is not None and patch_np.shape[0] > 0 and patch_np.shape[1] > 0:
+            ymin, xmin = y, x
+            ymax, xmax = y + patch_np.shape[0], x + patch_np.shape[1]
+            bbox_list.extend([ymin, xmin, ymax, xmax])
 
     if not bbox_list:
         raise RuntimeError("No valid tissue regions found for inference.")
@@ -43,41 +44,45 @@ def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path:
         "--wsi_path", wsi_path,
         "--output_dir", str(output_dir),
         "--model_dir", str(model_path),
-        "--bboxes", *map(str, bbox_list),
+        "--bbox", *map(str, bbox_list)
     ]
 
-    print("Running inference script...")
-    subprocess.run(command, check=True)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error during inference: {result.stderr}")
+        return np.array([])
 
-    inflammatory_json = output_dir / "detected-inflammatory-cells.json"
-    with open(inflammatory_json) as f:
-        data = json.load(f)
+    inflammatory_cells_path = output_dir / "detected-inflammatory-cells.json"
+    with open(inflammatory_cells_path, "r") as f:
+        inflammatory_cells = json.load(f)
 
-    points = np.array([point["point"][:2] for point in data["points"]])
-    np.save(output_dir / "inflam_cell_mm_coords.npy", points)
+    coords = np.array([[p["point"][0], p["point"][1]] for p in inflammatory_cells["points"]])
 
     if visualise:
         slide = TiffSlide(wsi_path)
-        pixel_coords = (points * 1000 / MICRONS_PER_PIXEL).astype(np.int32)
-        np.save(output_dir / "inflam_cell_pixel_coords.npy", pixel_coords)
 
-        level = slide.get_best_level_for_downsample(32)
+        # downsample factor of 5x is the highest resolution that qupath can handle
+        level = slide.get_best_level_for_downsample(5)
         thumb = slide.read_region((0, 0), level, slide.level_dimensions[level], as_array=True)
+
         scale_x = slide.level_dimensions[0][0] / thumb.shape[1]
         scale_y = slide.level_dimensions[0][1] / thumb.shape[0]
+
         overlay = thumb.copy()
 
-        for x, y in pixel_coords:
+        for x, y in coords:
             x_ds, y_ds = int(x / scale_x), int(y / scale_y)
             if 0 <= x_ds < overlay.shape[1] and 0 <= y_ds < overlay.shape[0]:
-                cv2.circle(overlay, (x_ds, y_ds), 3, (0, 0, 255), -1)
+                cv2.circle(overlay, (x_ds, y_ds), 3, (0, 255, 255), -1)
 
-        cv2.imwrite(str(output_dir / "inflam_overlay.tiff"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        # save as PNG
+        output_image_path_png = output_dir / "inflammatory_cells_overlay_downsampled.png"
+        cv2.imwrite(str(output_image_path_png), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        print(f"Overlay saved as PNG at: {output_image_path_png}")
 
-        # for QuPath
-        with open(output_dir / "inflammatory_cells_qupath.tsv", "w") as f:
-            f.write("Name\tX\tY\tClass\n")
-            for i, (x, y) in enumerate(pixel_coords):
-                f.write(f"Point {i}\t{x}\t{y}\tinflam\n")
+        # save as TIFF
+        output_image_path_tiff = output_dir / "inflammatory_cells_overlay_downsampled.tiff"
+        cv2.imwrite(str(output_image_path_tiff), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        print(f"Overlay saved as TIFF at: {output_image_path_tiff}")
 
-    return points
+    return coords

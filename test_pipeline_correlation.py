@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.panel import Panel
 from datetime import datetime
 import shutil
+from scipy.stats import spearmanr
 
 from main import KidneyGraderPipeline
 
@@ -27,6 +28,17 @@ def collect_wsi_paths(input_dir: Path):
             t_scores.append(t_score)
     return wsi_paths, t_scores
 
+def calculate_metrics(data):
+    metrics = {
+        "total_inflam_cells": data.get("total_inflam_cells", 0),
+        "mean_cells_per_tubule": data["summary_stats"].get("mean_cells_per_tubule", 0),
+        "max_cells_in_tubule": data["summary_stats"].get("max_cells_in_tubule", 0),
+        "total_cells_per_foci": sum(f["total_cells"] for f in data["summary_stats"]["focus_stats"]),
+        "mean_cells_per_foci": np.mean([f["mean_cells_per_tubule"] for f in data["summary_stats"]["focus_stats"]]),
+        "max_cells_per_foci": max(f["max_cells_in_tubule"] for f in data["summary_stats"]["focus_stats"])
+    }
+    return metrics
+
 def main():
     parser = argparse.ArgumentParser(description="Run full pipeline and compare predicted T scores to ground truth")
     parser.add_argument("--input_dir", required=True)
@@ -40,6 +52,12 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     wsi_paths, t_scores_gt = collect_wsi_paths(input_dir)
+
+    avg_cells_per_tubule = []
+    max_cells_per_tubule = []
+    total_cells_per_foci = []
+    mean_cells_per_foci = []
+    max_cells_per_foci = []
 
     console = Console()
     console.print(f"[bold cyan]Found {len(wsi_paths)} WSIs to process:[/bold cyan]")
@@ -70,14 +88,24 @@ def main():
             predicted_scores.append(predicted_score)
 
             # Update quantification JSON with GT T-score
-            quant_base = output_dir / "quantification" / f"{wsi_name}_quantification.json"
+            quant_base = output_dir / "quantification" / f"t{true_score}" / wsi_name / f"{wsi_name}_quantification.json"
             if quant_base.exists():
                 with open(quant_base) as f:
                     data = json.load(f)
                 data["ground_truth_t_score"] = true_score
                 with open(quant_base, "w") as f:
                     json.dump(data, f, indent=2)
-                inflam_counts.append(data["total_inflam_cells"])
+
+                # Calculate additional metrics
+                metrics = calculate_metrics(data)
+
+                # Store each metric in separate lists
+                inflam_counts.append(metrics["total_inflam_cells"])
+                avg_cells_per_tubule.append(metrics["mean_cells_per_tubule"])
+                max_cells_per_tubule.append(metrics["max_cells_in_tubule"])
+                total_cells_per_foci.append(metrics["total_cells_per_foci"])
+                mean_cells_per_foci.append(metrics["mean_cells_per_foci"])
+                max_cells_per_foci.append(metrics["max_cells_per_foci"])
 
                 # Move quantification to t-score subdir
                 quant_dest = output_dir / "quantification" / f"t{true_score}" / wsi_name
@@ -109,7 +137,12 @@ def main():
             "wsi_names": [p.stem for p in wsi_paths],
             "true_scores": t_scores_gt,
             "predicted_scores": predicted_scores,
-            "inflam_counts": inflam_counts
+            "inflam_counts": inflam_counts,
+            "avg_cells_per_tubule": avg_cells_per_tubule,
+            "max_cells_per_tubule": max_cells_per_tubule,
+            "total_cells_per_foci": total_cells_per_foci,
+            "mean_cells_per_foci": mean_cells_per_foci,
+            "max_cells_per_foci": max_cells_per_foci
         }, f, indent=2)
     console.print(f"[bold green]✓ Saved results to:[/bold green] {results_path}")
 
@@ -136,6 +169,30 @@ def main():
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(output_dir / "inflam_vs_gt_tscore.png")
+
+    # Plotting and analysis for additional metrics
+    metrics_data = {
+        "Average Cells per Tubule": avg_cells_per_tubule,
+        "Maximum Cells per Tubule": max_cells_per_tubule,
+        "Total Cells per Foci": total_cells_per_foci,
+        "Mean Cells per Foci": mean_cells_per_foci,
+        "Maximum Cells per Foci": max_cells_per_foci,
+    }
+
+    for metric_name, metric_values in metrics_data.items():
+        plt.figure(figsize=(6, 4))
+        plt.scatter(y_true, metric_values, alpha=0.7)
+        plt.xlabel("Ground Truth T Score")
+        plt.ylabel(metric_name)
+        plt.title(f"{metric_name} vs T Score")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(output_dir / f"{metric_name.replace(' ', '_').lower()}_vs_tscore.png")
+
+        # Correlation calculation
+        pearson_corr = np.corrcoef(y_true, metric_values)[0, 1]
+        spearman_corr = spearmanr(y_true, metric_values).correlation
+        console.print(f"[bold blue]{metric_name} Correlation:[/bold blue] Pearson: {pearson_corr:.2f}, Spearman: {spearman_corr:.2f}")
 
     from sklearn.metrics import confusion_matrix, classification_report
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3])

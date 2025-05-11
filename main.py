@@ -143,7 +143,7 @@ class KidneyGraderPipeline:
         self.logger.info(f"[Stage 3] WSI size: {slide.dimensions}")
         self.logger.info(f"[Stage 3] Tubule mask shape: {tubule_mask.shape}")
 
-        foci_mask = identify_foci(tubule_mask, min_distance=100)
+        foci_mask = identify_foci(tubule_mask, min_distance=200)
         counts_df = count_cells_in_tubules(cell_coords, tubule_mask, foci_mask)
 
         save_counts_csv(counts_df, paths["counts_csv"])

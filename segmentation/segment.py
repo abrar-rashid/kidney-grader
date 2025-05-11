@@ -5,7 +5,6 @@ import numpy as np
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 from tqdm import tqdm
-import json
 import torch
 import cv2
 from torch.utils.data import DataLoader
@@ -13,7 +12,6 @@ from matplotlib import cm
 import tifffile
 from tiffslide import TiffSlide
 from .utils import (
-    load_all_patches_in_folder,
     create_visualization,
     load_model,
     get_instance_mask
@@ -101,14 +99,27 @@ def process_wsi(wsi_path, model, device, output_dir):
 
 def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=False):
     # Save segmentation results and visualizations.
+
+    def downsample_array(arr, factor):
+        h, w = arr.shape
+        new_width = int(w / factor)
+        new_height = int(h / factor)
+        return cv2.resize(arr, (new_width, new_height), interpolation=cv2.INTER_NEAREST)
+
+    def visualize_instance_mask(mask, output_path, cmap_name='nipy_spectral'):
+        norm_mask = mask.astype(np.float32) / mask.max() if mask.max() > 0 else mask
+        cmap = cm.get_cmap(cmap_name, int(mask.max()) + 1)
+        color_image = (cmap(norm_mask)[..., :3] * 255).astype(np.uint8)
+        tifffile.imwrite(output_path, color_image, photometric='rgb')
+
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
+    result = {"instance_mask_paths": {}}
 
-    instance_mask_paths = {}
-
+    # save instance masks for each class
     for class_idx in range(1, NUM_CLASSES):
         if class_idx in [2, 3]:
-            continue  # skip veins and arteries for now
+            continue # skip veins and arteries for now
 
         instance_mask, num_instances = get_instance_mask(full_mask, tissue_type=class_idx)
         if num_instances == 0:
@@ -117,29 +128,18 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
         print(f"Saving instance mask for class {class_idx}")
         instance_mask_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.npy"
         np.save(instance_mask_path, instance_mask)
-        instance_mask_paths[class_idx] = str(instance_mask_path)
+        result["instance_mask_paths"][class_idx] = str(instance_mask_path)
 
         if visualise:
             print(f"Visualizing instance mask for class {class_idx}")
-            downsample_factor = 4
-            h, w = instance_mask.shape
-            small_mask = cv2.resize(instance_mask, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_NEAREST)
-
-            norm_mask = small_mask.astype(np.float32) / small_mask.max() if small_mask.max() > 0 else small_mask
-            cmap = cm.get_cmap('nipy_spectral', small_mask.max() + 1)
-            instance_mask_colored = (cmap(norm_mask)[:, :, :3] * 255).astype(np.uint8)
-
-            instance_colored_tiff_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff"
-            tifffile.imwrite(instance_colored_tiff_path, instance_mask_colored, photometric='rgb')
+            small_mask = downsample_array(instance_mask, factor=4)
+            visualize_instance_mask(small_mask, output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff")
 
         del instance_mask
         gc.collect()
 
-    result = {
-        "instance_mask_paths": instance_mask_paths
-    }
-
-    memmap_path = Path(output_dir) / "full_mask_memmap.dat"
+    # clean up memmap if it exists
+    memmap_path = output_dir / "full_mask_memmap.dat"
     if memmap_path.exists():
         try:
             memmap_path.unlink()
@@ -147,35 +147,50 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
         except Exception as e:
             print(f"Warning: Could not delete memmap file: {e}")
 
-    if not visualise:
-        del full_mask
-        gc.collect()
-        return result
+    if visualise:
+        print("Creating visualization of semantic mask")
+        colour_mask = create_visualization(full_mask)
+        semantic_mask_tiff_path = output_dir / f"{wsi_name}_semantic_mask_colored.tiff"
+        tifffile.imwrite(semantic_mask_tiff_path, np.array(colour_mask), photometric='rgb')
+        result["semantic_mask_colored_tiff_path"] = str(semantic_mask_tiff_path)
 
-    print("Creating visualization of semantic mask")
-    colour_mask = create_visualization(full_mask)
-    semantic_mask_tiff_path = output_dir / f"{wsi_name}_semantic_mask_colored.tiff"
-    tifffile.imwrite(semantic_mask_tiff_path, np.array(colour_mask), photometric='rgb')
-    result["semantic_mask_colored_tiff_path"] = str(semantic_mask_tiff_path)
+        # Optionally save raw semantic mask for debugging
+        semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
+        np.save(semantic_mask_npy_path, np.array(full_mask))
+        result["semantic_mask_npy_path"] = str(semantic_mask_npy_path)
 
-    # Optionally save raw semantic mask for debugging
-    semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
-    np.save(semantic_mask_npy_path, np.array(full_mask))
-    result["semantic_mask_npy_path"] = str(semantic_mask_npy_path)
+        if original_path:
+            try:
+                print("Saving overlay visualization")
+                print(f"Original image path: {original_path}")
+                if str(original_path).lower().endswith(('.png', '.jpg', '.jpeg')):
+                    original = Image.open(original_path).convert("RGB")
+                else:
+                    slide = TiffSlide(original_path)
+                    colour_mask_size = (colour_mask.width, colour_mask.height)
+                    original = slide.read_region((0, 0), 0, colour_mask_size).convert("RGB")
 
-    if original_path:
-        if str(original_path).lower().endswith(('.png', '.jpg', '.jpeg')):
-            original = Image.open(original_path).convert("RGB")
-        else:
-            slide = TiffSlide(original_path)
-            original = slide.get_thumbnail((colour_mask.width, colour_mask.height)).convert("RGB").resize(colour_mask.size)
+                # downsample visualization for optimization
+                downsample_factor = 8
+                small_mask = downsample_array(full_mask, downsample_factor)
 
-        print("Saving overlay visualization")
-        overlay = create_visualization(full_mask, original, alpha=0.4)
-        overlay_path = output_dir / f"{wsi_name}_overlay.png"
-        overlay.save(overlay_path)
-        result["overlay_path"] = str(overlay_path)
+                # resize original to match downsampled mask size
+                small_original = original.resize((small_mask.shape[1], small_mask.shape[0]))
+                if small_original.size != (small_mask.shape[1], small_mask.shape[0]):
+                    print(f"Warning: Size mismatch between mask and original image: "
+                          f"mask={small_mask.shape}, original={small_original.size}")
 
+                # mask overlaid on wsi
+                overlay = create_visualization(small_mask, small_original, alpha=0.4)
+                overlay_path = output_dir / f"{wsi_name}_overlay.png"
+                overlay.save(overlay_path)
+                print(f"Overlay saved at: {overlay_path}")
+                result["overlay_path"] = str(overlay_path)
+
+            except Exception as e:
+                print(f"Warning: Overlay visualization failed due to: {e}")
+
+    # clean up resources
     del full_mask
     gc.collect()
 

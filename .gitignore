@@ -21,6 +21,8 @@ checkpoints/
 *.pt
 
 output/
+output2/
+res/
 test_pipeline_correlation_output/
 test_correlation_output/
 .output_segment*

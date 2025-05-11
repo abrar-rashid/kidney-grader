@@ -1,247 +1,340 @@
-#!/usr/bin/env python3
-"""Improved inflammatory‑cell inference script
-------------------------------------------------
-Fixes the remaining runtime errors that were triggered by
-1. PyTorch slice stepping ("step must be greater than zero")
-2. Sparse‑matrix centroid calculation producing 3‑D tensors.
-
-The script now
-- avoids negative‑step slicing on torch tensors by swapping the last two
-  columns explicitly (`ctrs[:, (1,0)]`).
-- implements a *safe_centroids* helper that does **not** rely on the buggy
-  `torch.sparse.mm` call inside InstanSeg.
-- maintains the earlier fixes that guaranteed 2‑D label maps and avoided
-  the sparse‑mm path entirely.
-
-"""
-# ────────────────────────────────────────────────────────────────────
-import os, sys, json, argparse
+import os
+import sys
+import argparse
+import json
 from pathlib import Path
 import numpy as np
-
 import torch
 import ttach as tta
 from tiffslide import TiffSlide
 
-# make InstanSeg package importable
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to path for imports
+sys.path.append(str(Path(os.path.dirname(os.path.abspath(__file__))).parent))
 
+# Import InstanSeg modules
+from instanseg.utils.utils import _move_channel_axis
 from instanseg import InstanSeg
+from instanseg.utils.pytorch_utils import torch_fastremap, centroids_from_lab, get_masked_patches
+from instanseg.utils.pytorch_utils import _to_tensor_float32
 from instanseg.inference_class import _rescale_to_pixel_size
-from instanseg.utils.pytorch_utils import (
-    torch_fastremap,                     # safe utility
-    _to_tensor_float32,                  # safe utility
-)
 
-# ── CONSTANTS ──────────────────────────────────────────────────────
-INSTANSEG_MODEL        = "instanseg_brightfield_monkey.pt"
-MODEL_NAMES            = [
-    "1952372.pt",
-    "1950672.pt",
-    "1949389_2.pt",
-]
+# Constants
+INSTANSEG_MODEL = "instanseg_brightfield_monkey.pt"
+MODEL_NAMES = ["1952372.pt", "1950672.pt", "1949389_2.pt"]  # Public leaderboard #1 solution
 DESTINATION_PIXEL_SIZE = 0.5
-PATCH_SIZE             = 128
-USE_TTA                = True
-ORIGINAL_PIXEL_SIZE    = 0.24199951445730394
-RESCALE_OUTPUT         = DESTINATION_PIXEL_SIZE != 0.5
+PATCH_SIZE = 128
+USE_TTA = True
+NORMALIZE_HE = False
+RESCALE_OUTPUT = False if DESTINATION_PIXEL_SIZE == 0.5 else True
+ORIGINAL_PIXEL_SIZE = 0.24199951445730394
 
-# ────────────────────────────────────────────────────────────────────
-# Helper: centroid computation *without* sparse.mm
-@torch.no_grad()
-def safe_centroids(label: torch.Tensor):
-    """Return centroids (N,2) *y,x* and their label IDs (N,) for a 2‑D label map."""
-    label = label.long()
-    ids   = torch.unique(label)
-    ids   = ids[ids != 0]  # skip background
-    if ids.numel() == 0:
-        return torch.empty((0, 2), dtype=torch.float32, device=label.device), ids
 
-    centroids = []
-    for lid in ids:
-        ys, xs = torch.where(label == lid)
-        centroids.append(torch.tensor([ys.float().mean(), xs.float().mean()],
-                                      device=label.device))
-    return torch.stack(centroids), ids
-
-# ────────────────────────────────────────────────────────────────────
 class ModelEnsemble(torch.nn.Module):
     """Ensemble of multiple classification models with optional test-time augmentation."""
-    def __init__(self, paths, device="cuda", use_tta=False):
+    
+    def __init__(self, model_paths, device, use_tta=False):
         super().__init__()
         self.models = torch.nn.ModuleList([
-            self._load(p, device, use_tta) for p in paths
+            self.load_model(model_path, device, use_tta) for model_path in model_paths
         ])
-
-    @staticmethod
-    def _load(path, device, use_tta):
-        m = torch.jit.load(path).eval().to(device)
+        self.device = device
+    
+    def load_model(self, model_path, device, use_tta):
+        model = torch.jit.load(model_path).eval().to(device)
         if use_tta:
-            m = tta.ClassificationTTAWrapper(
-                m,
-                tta.Compose([
-                    tta.VerticalFlip(),
-                    tta.Rotate90([0, 90, 180, 270]),
-                ]),
-                merge_mode="mean",
-            )
-        return m
-
+            transforms = tta.Compose([
+                tta.VerticalFlip(),
+                tta.Rotate90(angles=[0, 90, 180, 270]),  
+            ])
+            model = tta.ClassificationTTAWrapper(model, transforms, merge_mode='mean')
+        return model
+    
     def forward(self, x):
         with torch.no_grad():
-            outs = [m(x) for m in self.models]
-        return torch.mean(torch.stack(outs, 0), 0)
+            predictions = [model(x) for model in self.models]
+            return torch.mean(torch.stack(predictions), dim=0)
 
-# ────────────────────────────────────────────────────────────────────
-# CLI
 
-def parse_cli():
-    p = argparse.ArgumentParser("Inflammatory‑cell inference")
-    p.add_argument("--wsi_path",  required=True)
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("--model_dir", required=True)
-    p.add_argument("--bboxes", type=float, nargs="+", help="x1 y1 x2 y2 ...")
-    return p.parse_args()
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Run inference on kidney transplant biopsy WSIs')
+    parser.add_argument('--wsi_path', type=str, required=True, help='Path to the WSI file')
+    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save output files')
+    parser.add_argument('--model_dir', type=str, required=True, help='Directory containing model files')
+    parser.add_argument('--bbox', type=int, nargs='+', 
+                      help='Bounding box coordinates in format: ymin xmin ymax xmax [ymin xmin ymax xmax ...]')
+    parser.add_argument('--bbox_file', type=str, help='Path to text file containing bounding box coordinates')
+    return parser.parse_args()
 
-# ────────────────────────────────────────────────────────────────────
-# Model loading
 
 def load_models(model_dir):
-    instanseg = InstanSeg(
-        torch.jit.load(Path(model_dir)/INSTANSEG_MODEL).to("cuda"), verbosity=0
+    """Load InstanSeg and classifier models."""
+    # Load InstanSeg model
+    instanseg_path = os.path.join(model_dir, INSTANSEG_MODEL)
+    instanseg_script = torch.jit.load(instanseg_path).to("cuda")
+    instanseg_model = InstanSeg(instanseg_script, verbosity=0)
+    
+    # Load classifier ensemble
+    classifier_paths = [os.path.join(model_dir, name) for name in MODEL_NAMES]
+    classifier = ModelEnsemble(
+        model_paths=classifier_paths,
+        device="cuda",
+        use_tta=USE_TTA
     )
-    ensemble  = ModelEnsemble(
-        [Path(model_dir)/n for n in MODEL_NAMES],
-        device="cuda", use_tta=USE_TTA
+    
+    return instanseg_model, classifier
+
+
+def process_bbox(slide, bbox, instanseg_model, classifier):
+    """Process a single bounding box region of the slide."""
+    # Extract bbox coordinates
+    y1, x1, y2, x2 = bbox
+    bbox_native = [np.array([y1, x1]), np.array([y2, x2])]
+    
+    # Read region from slide
+    image = slide.read_region((bbox_native[0][1], bbox_native[0][0]), 0, 
+                             (bbox_native[1][1] - bbox_native[0][1], 
+                              bbox_native[1][0] - bbox_native[0][0]), as_array=True)
+    
+    # Run InstanSeg model
+    labels, input_tensor = instanseg_model.eval_medium_image(
+        image, pixel_size=ORIGINAL_PIXEL_SIZE, 
+        rescale_output=RESCALE_OUTPUT, 
+        seed_threshold=0.1, 
+        tile_size=1024
     )
-    return instanseg, ensemble
-
-# ────────────────────────────────────────────────────────────────────
-# Patch extraction without sparse.mm path
-
-def masked_patches(label: torch.Tensor, rgb: torch.Tensor, patch_size: int = PATCH_SIZE):
-    """Return masked crops & binary masks for *every* instance label."""
-    # ensure 2‑D
-    label = label.squeeze()
-    if label.ndim > 2:
-        label = label.view(-1, *label.shape[-2:])[0]
-    assert label.ndim == 2
-
-    cent, ids = safe_centroids(label)
-    if ids.numel() == 0:
-        empty = torch.empty((0, 3, patch_size, patch_size))
-        return empty, empty[:, :1]
-
-    pad = patch_size // 2
-    rgb_p   = torch.nn.functional.pad(rgb,  (pad, pad, pad, pad))
-    lab_p   = torch.nn.functional.pad(label, (pad, pad, pad, pad))
-
-    crops, masks = [], []
-    for (y, x), lid in zip(cent.long(), ids):
-        y += pad; x += pad
-        crops.append(rgb_p[:,  y-pad:y+pad,   x-pad:x+pad])
-        masks.append((lab_p[y-pad:y+pad, x-pad:x+pad] == lid)
-                      .unsqueeze(0).float())
-    return torch.stack(crops), torch.stack(masks)
-
-# ────────────────────────────────────────────────────────────────────
-# Single‑bbox processing
-
-def process_bbox(slide, bbox, instanseg, classifier):
-    x1, y1, x2, y2 = bbox
-    w,  h          = x2 - x1, y2 - y1
-    region         = slide.read_region((y1, x1), 0, (h, w), as_array=True)
-
-    # ── InstanSeg segmentation
-    labels, _ = instanseg.eval_medium_image(
-        region, pixel_size=ORIGINAL_PIXEL_SIZE,
-        rescale_output=RESCALE_OUTPUT, seed_threshold=0.1, tile_size=1024
-    )
-    labels = torch_fastremap(labels.cpu()).squeeze()
-    if labels.ndim == 3:
-        labels = labels[0] if labels.shape[0] <= 3 else labels[..., 0]
-
-    # ── RGB tensor rescaled to DESTINATION_PIXEL_SIZE
-    rgb = _rescale_to_pixel_size(
-        _to_tensor_float32(region), ORIGINAL_PIXEL_SIZE, DESTINATION_PIXEL_SIZE
-    ).cpu()
-
-    # ── crops & classification
-    crops, masks = masked_patches(labels, rgb)
-    if len(crops) == 0:
-        return {"coords": np.empty((0, 2)),
-                "classes": np.empty((0,)),
-                "confidences": np.empty((0, 3))}
-
-    x = torch.cat((crops / 255.0, masks), 1).to("cuda")
+    
+    # Convert image to tensor
+    tensor = _rescale_to_pixel_size(
+        _to_tensor_float32(image), 
+        ORIGINAL_PIXEL_SIZE, 
+        DESTINATION_PIXEL_SIZE
+    ).to("cpu")
+    
+    # Process labels and get masked patches
+    labels = labels.to("cpu")
+    labels = torch_fastremap(labels)
+    
+    # Check if labels contain any cells
+    if labels.max() == 0:
+        # Return empty results for bounding boxes with no cells
+        return {
+            'coords': np.array([]).reshape(0, 2),
+            'classes': np.array([]),
+            'confidences': np.array([]).reshape(0, 3)
+        }
+    
+    crops, masks = get_masked_patches(labels, tensor.to("cpu"), patch_size=PATCH_SIZE)
+    x = torch.cat((crops / 255.0, masks), dim=1)
+    
+    # Run classification
+    batch_size = 1024
+    y_hat = []
+    
     with torch.amp.autocast("cuda"):
-        y_hat = classifier(x).cpu()[:, -3:]  # (N,3)
+        with torch.no_grad():
+            for i in range(0, len(x), batch_size):
+                batch_result = classifier(x[i:i+batch_size].float().to("cuda"))
+                y_hat.append(batch_result)
+    
+    # Process classification results
+    y_hat = torch.cat(y_hat, dim=0)
+    y_hat = y_hat[:, -3:]  # Because of dual training
+    y_hat = y_hat.cpu()
+    
+    # Get confidences and coordinates
+    conf = y_hat.softmax(1)
+    y_hat = y_hat.argmax(1)
+    coords = centroids_from_lab(labels)[0]
+    
+    # Scale coordinates back to original scale
+    coords_scaled = coords.cpu().numpy()[:, ::-1] * (DESTINATION_PIXEL_SIZE / ORIGINAL_PIXEL_SIZE) + bbox_native[0][::-1]
+    
+    return {
+        'coords': coords_scaled,
+        'classes': y_hat.cpu().numpy(),
+        'confidences': conf.cpu().numpy()
+    }
 
-    conf    = y_hat.softmax(1).numpy()
-    classes = y_hat.argmax(1).numpy()
 
-    # ── centroid coordinates back to slide space
-    cent, _ = safe_centroids(labels)
-    coords  = cent[:, (1, 0)].numpy()            # swap to x,y without negative step
-    coords *= DESTINATION_PIXEL_SIZE / ORIGINAL_PIXEL_SIZE
-    coords += np.array([x1, y1])
+def create_output_dicts(all_coords, all_classes, all_confidences):
+    """Create dictionaries for output JSON files."""
+    # Initialize output dictionaries
+    output_dicts = {
+        "lymphocytes": {
+            "name": "lymphocytes",
+            "type": "Multiple points",
+            "version": {"major": 1, "minor": 0},
+            "points": [],
+        },
+        "monocytes": {
+            "name": "monocytes",
+            "type": "Multiple points",
+            "version": {"major": 1, "minor": 0},
+            "points": [],
+        },
+        "inflammatory-cells": {
+            "name": "inflammatory-cells",
+            "type": "Multiple points",
+            "version": {"major": 1, "minor": 0},
+            "points": [],
+        }
+    }
+    
+    # Fill dictionaries with detection points
+    for idx, (coords, class_label, confidence) in enumerate(zip(all_coords, all_classes, all_confidences)):
+        x, y = coords
+        
+        # Convert to millimeters
+        x_mm = x * ORIGINAL_PIXEL_SIZE / 1000
+        y_mm = y * ORIGINAL_PIXEL_SIZE / 1000
+        
+        # Create point records
+        point_data = {
+            "name": f"Point {idx}",
+            "point": [x_mm, y_mm, ORIGINAL_PIXEL_SIZE],
+        }
+        
+        # Add points with their probabilities
+        inflammatory_point = point_data.copy()
+        inflammatory_point["probability"] = float(confidence[0] + confidence[1])
+        output_dicts["inflammatory-cells"]["points"].append(inflammatory_point)
+        
+        lymphocyte_point = point_data.copy()
+        lymphocyte_point["probability"] = float(confidence[0])
+        output_dicts["lymphocytes"]["points"].append(lymphocyte_point)
+        
+        monocyte_point = point_data.copy()
+        monocyte_point["probability"] = float(confidence[1])
+        output_dicts["monocytes"]["points"].append(monocyte_point)
+    
+    return (
+        output_dicts["lymphocytes"],
+        output_dicts["monocytes"],
+        output_dicts["inflammatory-cells"]
+    )
 
-    return {"coords": coords, "classes": classes, "confidences": conf}
 
-# ────────────────────────────────────────────────────────────────────
-# JSON utilities
+def save_outputs(output_dir, lymphocytes_dict, monocytes_dict, inflammatory_dict, image_path=None):
+    """Save output JSON files and create record if needed."""
+    # Save detection JSONs
+    outputs = {
+        "detected-lymphocytes.json": lymphocytes_dict,
+        "detected-monocytes.json": monocytes_dict,
+        "detected-inflammatory-cells.json": inflammatory_dict
+    }
+    
+    for filename, content in outputs.items():
+        output_path = os.path.join(output_dir, filename)
+        with open(output_path, 'w') as f:
+            json.dump(content, f, indent=4)
+        print(f"Saved {output_path}")
+    
+    # Create record JSON if image_path is provided (not for submission)
+    if image_path:
+        name = str(Path(image_path).name.replace("_PAS_CPG.tif", ""))
+        record = {
+            "pk": name,
+            "inputs": [
+                {
+                    "image": {
+                        "name": f"{name}_PAS_CPG.tif"
+                    },
+                    "interface": {
+                        "slug": "kidney-transplant-biopsy",
+                        "kind": "Image",
+                        "super_kind": "Image",
+                        "relative_path": "images/kidney-transplant-biopsy-wsi-pas"
+                    }
+                }
+            ],
+            "outputs": [
+                {
+                    "interface": {
+                        "slug": output_slug,
+                        "kind": "Multiple points",
+                        "super_kind": "File",
+                        "relative_path": output_path
+                    }
+                }
+                for output_slug, output_path in {
+                    "detected-lymphocytes": "detected-lymphocytes.json",
+                    "detected-monocytes": "detected-monocytes.json",
+                    "detected-inflammatory-cells": "detected-inflammatory-cells.json"
+                }.items()
+            ]
+        }
+        
+        with open("./predictions.json", 'w') as f:
+            json.dump([record], f, indent=4)
+        print("Created predictions record")
+        
+        return [record]
+    
+    return []
 
-def assemble_json(coords, confs):
-    def template(name):
-        return {"name": name, "type": "Multiple points",
-                "version": {"major": 1, "minor": 0}, "points": []}
-
-    outs = {k: template(k) for k in ["lymphocytes", "monocytes", "inflammatory-cells"]}
-
-    for i, (xy, cf) in enumerate(zip(coords, confs)):
-        x, y = xy
-        base = {"name": f"Point {i}",
-                "point": [x * ORIGINAL_PIXEL_SIZE / 1000,
-                           y * ORIGINAL_PIXEL_SIZE / 1000,
-                           ORIGINAL_PIXEL_SIZE]}
-        outs["inflammatory-cells"]["points"].append({**base, "probability": float(cf[0] + cf[1])})
-        outs["lymphocytes"]["points"].append({**base, "probability": float(cf[0])})
-        outs["monocytes"]["points"].append({**base, "probability": float(cf[1])})
-    return outs
-
-# ────────────────────────────────────────────────────────────────────
-# Main
 
 def main():
-    args = parse_cli()
-    if args.bboxes is None or len(args.bboxes) % 4:
-        raise ValueError("--bboxes must contain 4×N numbers")
-
+    """Main function to run inference process."""
+    # Parse arguments
+    args = parse_arguments()
+    
+    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    print("Processing slide:", args.wsi_path)
-
-    instanseg, classifier = load_models(args.model_dir)
+    print(f"Processing slide: {args.wsi_path}")
+    print(f"Output directory: {args.output_dir}")
+    
+    # Load models
+    instanseg_model, classifier = load_models(args.model_dir)
+    
+    # Open slide
     slide = TiffSlide(args.wsi_path)
-
+    
+    # Process bounding boxes from file if provided
+    bbox_list = []
+    if args.bbox_file:
+        if args.bbox:
+            raise ValueError("Cannot provide both --bbox and --bbox_file")
+        
+        print(f"Reading bounding box coordinates from: {args.bbox_file}")
+        with open(args.bbox_file, 'r') as f:
+            for line in f:
+                coords = list(map(int, line.strip().split()))
+                if len(coords) != 4:
+                    raise ValueError(f"Invalid bbox coordinates: {line.strip()}")
+                bbox_list.extend(coords)
+        args.bbox = bbox_list
+    
+    # Process bounding boxes
     all_results = []
-    for i in range(0, len(args.bboxes), 4):
-        bbox = args.bboxes[i:i+4]
-        print(" bbox:", bbox)
-        all_results.append(process_bbox(slide, bbox, instanseg, classifier))
-
-    coords      = np.concatenate([r["coords"]      for r in all_results])
-    classes     = np.concatenate([r["classes"]     for r in all_results])
-    confidences = np.concatenate([r["confidences"] for r in all_results])
-
-    js = assemble_json(coords, confidences)
-    for fn, key in [("detected-lymphocytes.json", "lymphocytes"),
-                    ("detected-monocytes.json",   "monocytes"),
-                    ("detected-inflammatory-cells.json", "inflammatory-cells")]:
-        with open(Path(args.output_dir)/fn, "w") as f:
-            json.dump(js[key], f, indent=4)
-        print("saved", fn)
-
-    print("✓ inference finished")
+    if args.bbox is not None:
+        if len(args.bbox) % 4 != 0:
+            raise ValueError(f"Number of bbox coordinates ({len(args.bbox)}) must be divisible by 4")
+        
+        # Process each bbox
+        for i in range(0, len(args.bbox), 4):
+            if i + 3 < len(args.bbox):
+                bbox = args.bbox[i:i+4]
+                print(f"Processing bbox: {bbox}")
+                result = process_bbox(slide, bbox, instanseg_model, classifier)
+                all_results.append(result)
+    else:
+        # Process entire slide (not implemented in original code)
+        print("No bounding boxes provided. Please specify bounding boxes with --bbox or --bbox_file.")
+        return 1
+    
+    # Combine results from all bounding boxes
+    all_coords = np.concatenate([r['coords'] for r in all_results]) if all_results else np.array([])
+    all_classes = np.concatenate([r['classes'] for r in all_results]) if all_results else np.array([])
+    all_confidences = np.concatenate([r['confidences'] for r in all_results]) if all_results else np.array([])
+    
+    # Create and save output files
+    lymphocytes_dict, monocytes_dict, inflammatory_dict = create_output_dicts(
+        all_coords, all_classes, all_confidences)
+    
+    save_outputs(args.output_dir, lymphocytes_dict, monocytes_dict, inflammatory_dict, args.wsi_path)
+    
+    print(f"Inference completed. Results saved to {args.output_dir}")
     return 0
 
 

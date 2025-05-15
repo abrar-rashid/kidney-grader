@@ -1,5 +1,5 @@
 import h5py
-from segmentation.utils import is_tissue_patch
+from detection.patch_extractor import is_tissue_patch
 import torch
 from torch.utils.data import Dataset
 import numpy as np

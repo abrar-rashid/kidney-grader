@@ -20,16 +20,9 @@ checkpoints/
 *.pth
 *.pt
 
-output/
-output2/
+output*
 res/
-test_pipeline_correlation_output/
-test_correlation_output/
 .output_segment*
-segmentation/outputs/
-quantification/outputs/
-grading/outputs/
-patch_out/
 test/
 *.log
 *.npy

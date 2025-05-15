@@ -49,6 +49,9 @@ def count_cells_in_tubules(nuclei_coords, instance_mask, foci_mask):
             'focus_id': int(focus_id)
         })
 
+    if not results:
+        return pd.DataFrame(columns=['tubule_id', 'x', 'y', 'cell_count', 'focus_id'])
+
     return pd.DataFrame(results).sort_values("cell_count", ascending=False)
 
 

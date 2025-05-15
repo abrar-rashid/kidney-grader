@@ -10,10 +10,9 @@ from tqdm import tqdm
 from skimage.segmentation import find_boundaries
 from scipy.ndimage import binary_dilation
 from medpy.metric.binary import hd, assd
+from segmentation.segment import process_regular_image_tensor, load_model
 
-from segmentation.segment import post_process_predictions
 from segmentation.utils import get_binary_class_mask, get_instance_mask
-from segmentation.improved_unet import ImprovedUNet
 from segmentation.dataset import H5SegmentationDataset
 from segmentation.config import CLASS_NAMES, NUM_CLASSES
 
@@ -115,17 +114,11 @@ def compute_map(pred_mask, gt_mask, thresholds=np.arange(0.5, 1.0, 0.05)):
         aps.append(ap)
     return np.mean(aps)
 
-def run_evaluation(checkpoint_path="checkpoints/improved_unet_best.pth", 
-                   h5_path="data/train_data.h5",
+def run_evaluation(checkpoint_path="checkpoints/best_current_model.pth", 
+                   h5_path="data/test_data.h5",
                    output_dir="evaluation_results"):
-
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = ImprovedUNet(n_classes=NUM_CLASSES)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    model.to(device)
-    model.eval()
 
     dataset = H5SegmentationDataset(h5_path, is_training=False, tissue_threshold=0)
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
@@ -145,17 +138,13 @@ def run_evaluation(checkpoint_path="checkpoints/improved_unet_best.pth",
     percentage_count_error = [[] for _ in range(NUM_CLASSES)]
 
     print("Running evaluation...")
+    model = load_model(checkpoint_path, device=device, weights_only=True)
     with torch.no_grad():
         for images, masks in tqdm(loader):
             images, masks = images.to(device), masks.to(device)
-            outputs = model(images)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
 
-            raw_pred = torch.softmax(outputs.squeeze(0).cpu(), dim=0).numpy()
-            h, w = raw_pred.shape[1:]
-            slide_map = {0: (0, 0, w, h)}
-            pred_np = post_process_predictions([raw_pred], slide_map, (h, w))
+            full_mask = process_regular_image_tensor(images, model=model, device=device)
+            pred_np = full_mask
 
             mask_np = masks.cpu().numpy()[0]
 

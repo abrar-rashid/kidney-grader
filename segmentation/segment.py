@@ -1,3 +1,4 @@
+from __future__ import annotations
 import gc
 import logging
 from pathlib import Path
@@ -18,15 +19,6 @@ from .utils import (
 )
 from detection.patch_extractor import extract_patches_from_wsi
 from .config import DEFAULT_SEGMENTATION_MODEL_PATH, NUM_CLASSES, PATCH_OVERLAP, PATCH_SIZE, SEGMENTATION_OUTPUT_DIR
-
-
-def post_process_predictions(predictions, slide_map, original_shape):
-    full_mask = np.zeros(original_shape, dtype=np.uint8)
-    for i, pred in enumerate(predictions):
-        x, y, w, h = slide_map[i]
-        pred_class = np.argmax(pred, axis=0)
-        full_mask[y:y+h, x:x+w] = pred_class
-    return full_mask
 
 
 def process_regular_image(img_path, model, device):
@@ -97,14 +89,108 @@ def process_wsi(wsi_path, model, device, output_dir):
     torch.cuda.empty_cache()
     return full_mask
 
+
+def process_regular_image_tensor(img_tensor, model, device):
+    # for eval script, which uses tensors from the h5 test dataset
+    if len(img_tensor.shape) == 4 and img_tensor.shape[0] == 1:
+        img_tensor = img_tensor.squeeze(0)  # Remove batch dimension if size 1
+
+    img_tensor = img_tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(img_tensor)
+        output = output[0] if isinstance(output, tuple) else output
+        return torch.argmax(output.squeeze(), dim=0).cpu().numpy()
+
+
+def visualize_instance_mask(mask: np.ndarray, output_path: Path, cmap_name: str = "nipy_spectral") -> None:
+    norm_mask = mask.astype(np.float32) / mask.max() if mask.max() > 0 else mask
+    cmap = cm.get_cmap(cmap_name, int(mask.max()) + 1)
+    color_image = (cmap(norm_mask)[..., :3] * 255).astype(np.uint8)
+    tifffile.imwrite(str(output_path), color_image, photometric="rgb")
+
+
+from typing import Optional
+
+import numpy as np
+from matplotlib import cm
+from PIL import Image
+
+
+def colourise_instances(
+    mask: np.ndarray,
+    cmap_name: str = "nipy_spectral",
+    shuffle: bool = True,
+    seed: Optional[int] = None,
+) -> Image.Image:
+    # credit to ChatGPT. Colours instances in the mask and ensures neighbouring instances are non-similar colours
+
+    """
+    Map each *instance id* in a 2‑D label image to a unique RGB colour.
+
+    * **Vectorised:** O(N) time, no Python loops over instance ids.
+    * **Deterministic option:** pass `shuffle=False` or a fixed `seed`.
+    * Works with NumPy arrays *and* mem‑maps; the input is never copied.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        2‑D array where background = 0 and each connected component has a
+        positive integer id (output of `get_instance_mask`).
+    cmap_name : str, optional
+        Any Matplotlib colormap name (default `"nipy_spectral"`).
+    shuffle : bool, optional
+        If *True* (default) colours are randomly permuted so neighbouring
+        ids receive very different hues.  Set to *False* for reproducible
+        yet still visually distinct colouring.
+    seed : int or None, optional
+        Seed for the RNG that does the shuffling.  Ignored when
+        `shuffle=False`.
+
+    Returns
+    -------
+    PIL.Image.Image
+        RGB image (mode `"RGB"`) the same H×W as `mask`.
+    """
+    if mask.ndim != 2:
+        raise ValueError("`mask` must be a 2‑D array")
+
+    # ------------------------------------------------------------------ LUT
+    max_id = int(mask.max())
+    if max_id == 0:                     # nothing but background
+        return Image.fromarray(np.zeros((*mask.shape, 3), np.uint8), mode="RGB")
+
+    # Build colour look‑up table once, length = (max_id + 1)
+    cmap = cm.get_cmap(cmap_name, max_id + 1)
+    lut = (cmap(np.arange(max_id + 1))[:, :3] * 255).astype(np.uint8)
+
+    # Optional permutation so adjacent ids → distant colours
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(max_id) + 1   # exclude index 0 (background)
+        lut[1:] = lut[perm]
+
+    # ------------------------------------------------------------------ map
+    # NumPy advanced indexing turns the 2‑D label image straight into an
+    # H×W×3 RGB array in one vectorised step, executed in C.
+    rgb = lut[mask]
+
+    return Image.fromarray(rgb, mode="RGB")
+
+def overlay_rgb(base: Image.Image, mask_rgb: Image.Image, alpha: float = 0.4) -> Image.Image:
+    return Image.blend(base, mask_rgb, alpha)
+
 def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=False):
     # Save segmentation results and visualizations.
 
     def downsample_array(arr, factor):
+        arr = arr.astype(np.int32, copy=False)   # ← ADD THIS LINE
         h, w = arr.shape
-        new_width = int(w / factor)
+        new_width  = int(w / factor)
         new_height = int(h / factor)
-        return cv2.resize(arr, (new_width, new_height), interpolation=cv2.INTER_NEAREST)
+        return cv2.resize(arr,
+                        (new_width, new_height),
+                        interpolation=cv2.INTER_NEAREST)
 
     def visualize_instance_mask(mask, output_path, cmap_name='nipy_spectral'):
         norm_mask = mask.astype(np.float32) / mask.max() if mask.max() > 0 else mask
@@ -122,18 +208,59 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
             continue # skip veins and arteries for now
 
         instance_mask, num_instances = get_instance_mask(full_mask, tissue_type=class_idx)
+        print(f"Class {class_idx}: {num_instances} instances found")
         if num_instances == 0:
             continue
 
         print(f"Saving instance mask for class {class_idx}")
-        instance_mask_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.npy"
-        np.save(instance_mask_path, instance_mask)
-        result["instance_mask_paths"][class_idx] = str(instance_mask_path)
+        # determine the optimal data type based on the maximum ID
+        max_id = instance_mask.max()
+        dtype = np.uint16 if max_id < 65535 else np.uint32
+        instance_mask = instance_mask.astype(dtype, copy=False)
+
+        # construct the output file path as a BigTIFF file
+        tiff_path = output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff"
+
+        # save the instance mask as a compressd tiled BigTIFF
+        tifffile.imwrite(
+            str(tiff_path),
+            instance_mask,
+            bigtiff=True,
+            compression=("zstd", 5),
+            tile=(512, 512),
+            photometric='minisblack'
+        )
+
+        # update the result dictionary with the new file path
+        result["instance_mask_paths"][class_idx] = str(tiff_path)
 
         if visualise:
-            print(f"Visualizing instance mask for class {class_idx}")
-            small_mask = downsample_array(instance_mask, factor=4)
-            visualize_instance_mask(small_mask, output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff")
+            # print(f"Visualizing instance mask for class {class_idx}")
+            # small_mask = downsample_array(instance_mask, factor=4)
+            # visualize_instance_mask(small_mask, output_dir / f"{wsi_name}_full_instance_mask_class{class_idx}.tiff")
+
+            if original_path is not None:
+                try:
+                    if str(original_path).lower().endswith((".png", ".jpg", ".jpeg")):
+                        original = Image.open(original_path).convert("RGB")
+                    else:
+                        slide = TiffSlide(original_path)
+                        original = slide.read_region((0, 0), 0, (full_mask.shape[1], full_mask.shape[0])).convert("RGB")
+
+                    # down‑sample both mask and image same as semantic mask
+                    downsample_factor = 8
+                    small_inst_mask = downsample_array(instance_mask, downsample_factor)
+                    small_original = original.resize((small_inst_mask.shape[1], small_inst_mask.shape[0]))
+
+                    coloured_mask = colourise_instances(small_inst_mask)
+                    overlay_img = overlay_rgb(small_original, coloured_mask, alpha=0.4)
+
+                    overlay_path = output_dir / f"{wsi_name}_overlay_class{class_idx}.png"
+                    overlay_img.save(overlay_path)
+                    result["instance_overlay_paths"][class_idx] = str(overlay_path)
+                    print(f"Instance overlay saved: {overlay_path}")
+                except Exception as e:
+                    print(f"Warning: Instance overlay for class {class_idx} failed: {e}")
 
         del instance_mask
         gc.collect()
@@ -150,14 +277,6 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
     if visualise:
         print("Creating visualization of semantic mask")
         colour_mask = create_visualization(full_mask)
-        semantic_mask_tiff_path = output_dir / f"{wsi_name}_semantic_mask_colored.tiff"
-        tifffile.imwrite(semantic_mask_tiff_path, np.array(colour_mask), photometric='rgb')
-        result["semantic_mask_colored_tiff_path"] = str(semantic_mask_tiff_path)
-
-        # Optionally save raw semantic mask for debugging
-        semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
-        np.save(semantic_mask_npy_path, np.array(full_mask))
-        result["semantic_mask_npy_path"] = str(semantic_mask_npy_path)
 
         if original_path:
             try:
@@ -197,25 +316,33 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
     return result
 
 
-def run_segment(in_path, model_path=DEFAULT_SEGMENTATION_MODEL_PATH,
+def run_segment(in_data, model_path=DEFAULT_SEGMENTATION_MODEL_PATH,
                 output_dir=SEGMENTATION_OUTPUT_DIR, visualise=False):
     # Entry function to run segmentation on WSI or regular image.
-    wsi_name = Path(in_path).stem
-    output_dir = Path(output_dir) / wsi_name
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(model_path, device=device, weights_only=True)
 
-    if str(in_path).lower().endswith(('.svs', '.tif', '.tiff')):
-        logging.info(f"Segmenting WSI: {in_path}")
-        full_mask = process_wsi(in_path, model, device, output_dir)
-    elif str(in_path).lower().endswith(('.png', '.jpg', '.jpeg')):
-        logging.info(f"Segmenting image: {in_path}")
-        full_mask = process_regular_image(in_path, model, device)
-    else:
-        raise ValueError("Unsupported input format")
+    # check if input is a file path or a tensor
+    if isinstance(in_data, str):
+        wsi_name = Path(in_data).stem
+        output_dir = Path(output_dir) / wsi_name
 
-    return save_results(full_mask, wsi_name, output_dir, in_path, visualise)
+        if in_data.lower().endswith(('.svs', '.tif', '.tiff')):
+            logging.info(f"Segmenting WSI: {in_data}")
+            full_mask = process_wsi(in_data, model, device, output_dir)
+            return save_results(full_mask, wsi_name, output_dir, original_path=in_data, visualise=visualise)
+        elif in_data.lower().endswith(('.png', '.jpg', '.jpeg')):
+            logging.info(f"Segmenting image: {in_data}")
+            full_mask = process_regular_image(in_data, model, device)
+            return save_results(full_mask, wsi_name, output_dir, original_path=in_data, visualise=visualise)
+        else:
+            raise ValueError("Unsupported input format")
+    elif torch.is_tensor(in_data):
+        logging.info(f"Segmenting tensor image")
+        full_mask = process_regular_image_tensor(in_data, model, device)
+        return full_mask
+    else:
+        raise ValueError("Unsupported input type")
 
 
 if __name__ == "__main__":

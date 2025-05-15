@@ -30,9 +30,11 @@ def setup_logging(output_dir: Path) -> None:
 class KidneyGraderPipeline:
     # Main pipeline for kidney biopsy grading
     
-    def __init__(self, output_dir: str, model_path: str = "checkpoints/improved_unet_best.pth"): # TODO add instanseg model path here
+    def __init__(self, output_dir: str, model_path: str = "checkpoints/best_current_model.pth", prob_thres: float = 0.80, foci_dist = 500):
         self.output_dir = Path(output_dir)
         self.model_path = model_path
+        self.prob_thres = prob_thres
+        self.foci_dist = foci_dist
 
         setup_logging(self.output_dir)
         self.logger = logging.getLogger(__name__)
@@ -51,39 +53,43 @@ class KidneyGraderPipeline:
 
     def get_output_paths(self, wsi_path: str) -> Dict[str, Path]:
         wsi_name = Path(wsi_path).stem
+        prob_tag = f"p{self.prob_thres:.2f}".replace(".", "")
+        dist_tag = f"d{self.foci_dist}"
         return {
             "wsi_name": wsi_name,
-            "tubule_mask": self.segmentation_dir / wsi_name / f"{wsi_name}_full_instance_mask_class1.npy",
-            "inflam_cell_mask": self.detection_dir / wsi_name / "inflam_cell_instance_mask.npy",
-            "counts_csv": self.quantification_dir / f"{wsi_name}_tubule_counts.csv",
-            "quant_json": self.quantification_dir / f"{wsi_name}_quantification.json",
-            "grading_report": self.grading_dir / f"{wsi_name}_grading_report.json"
+            "tubule_mask": self.segmentation_dir / wsi_name / f"{wsi_name}_full_instance_mask_class1.tiff",
+            "inflam_cell_mask": self.detection_dir / wsi_name / f"detected-inflammatory-cells-{prob_tag}.json",
+            "counts_csv": self.quantification_dir / f"{wsi_name}_{prob_tag}_{dist_tag}" / f"{wsi_name}_tubule_counts.csv",
+            "quant_json": self.quantification_dir / f"{wsi_name}_{prob_tag}_{dist_tag}" / f"{wsi_name}_quantification.json",
+            "grading_report": self.grading_dir / f"{wsi_name}_{prob_tag}_{dist_tag}" / "grading_report.json"
         }
     
     def run_stage1(self, wsi_path: str, force: bool = False, visualise: bool = False) -> Dict[str, Any]:
         from segmentation.segment import run_segment
-        # to run semantic segmentation of WSI
 
         self.logger.info(f"Running Stage 1: Segmentation for {wsi_path}")
         wsi_name = Path(wsi_path).stem
         output_dir = self.segmentation_dir / wsi_name
-        semantic_mask_npy_path = output_dir / f"{wsi_name}_semantic_mask.npy"
-        semantic_mask_png_path = output_dir / f"{wsi_name}_semantic_mask.png"
+        semantic_mask_path = output_dir / f"{wsi_name}_semantic_mask.tiff"
+        instance_mask_path1 = output_dir / f"{wsi_name}_full_instance_mask_class1.tiff"
+        instance_mask_path4 = output_dir / f"{wsi_name}_full_instance_mask_class4.tiff"
 
-        if semantic_mask_npy_path.exists() and not force:
-            self.logger.info(f"Segmentation mask already exists at {semantic_mask_npy_path}, skipping segmentation.")
+        # check if both instance masks exist before skipping
+        if instance_mask_path1.exists() and instance_mask_path4.exists() and not force:
+            self.logger.info(f"Segmentation mask already exists at {output_dir}, skipping segmentation.")
             instance_mask_paths = {
                 int(p.stem.split("class")[-1]): str(p)
-                for p in output_dir.glob(f"{wsi_name}_full_instance_mask_class*.npy")
+                for p in output_dir.glob(f"{wsi_name}_full_instance_mask_class*.tiff")
             }
             return {
-                "semantic_mask_png_path": str(semantic_mask_png_path),
-                "semantic_mask_npy_path": str(semantic_mask_npy_path),
+                "semantic_mask_path": str(semantic_mask_path),
                 "instance_mask_paths": instance_mask_paths
             }
 
+        # run segmentation if not cached
         result = run_segment(wsi_path, output_dir=self.segmentation_dir, model_path=self.model_path, visualise=visualise)
         return result
+
 
     def run_stage2(self, wsi_path, force: bool = False, visualise: bool = False) -> dict:
         from detection.detect import run_inflammatory_cell_detection
@@ -91,32 +97,62 @@ class KidneyGraderPipeline:
         self.logger.info("Running Stage 2: Inflammatory cell detection")
         wsi_name = Path(wsi_path).stem
         output_dir = self.detection_dir / wsi_name
-        mm_coords_path = output_dir / "inflam_cell_mm_coords.npy"
-        pixel_coords_path = output_dir / "inflam_cell_pixel_coords.npy"
 
-        output_dir.mkdir(exist_ok=True)
+        prob_thres = self.prob_thres
+        thr_tag = f"p{prob_thres:.2f}".replace(".", "")
+        
+        json_thresholded_path = output_dir / f"detected-inflammatory-cells-{thr_tag}.json"
 
-        if mm_coords_path.exists() and not force:
-            self.logger.info(f"Coordinate file already exists at {mm_coords_path}, skipping detection.")
-            mm_coords = np.load(mm_coords_path)
-        else:
-            mm_coords = run_inflammatory_cell_detection(
-                wsi_path=wsi_path,
-                output_dir=output_dir,
-                model_path="detection/models/",
-                visualise=visualise
+        # check if file exists and log the details
+        self.logger.info(f"Checking if detection file exists at: {json_thresholded_path}")
+        if json_thresholded_path.exists() and not force:
+            self.logger.info(f"Inflammatory cell detection already exists at {json_thresholded_path}, skipping Stage 2.")
+            with open(json_thresholded_path) as f:
+                inflam = json.load(f)
+            mm_coords = np.array(
+                [[pt["point"][0], pt["point"][1]] for pt in inflam["points"]],
+                dtype=np.float32,
             )
-            np.save(mm_coords_path, mm_coords)
+            self.logger.info(f"Detected {len(mm_coords)} inflam_cells from cached results.")
+            return {
+                "wsi_name": wsi_name,
+                "prob_threshold": prob_thres,
+                "inflam_cell_coords_path": str(json_thresholded_path),
+            }
 
-        self.logger.info(f"Detected {len(mm_coords)} inflam_cells")
+        # If not cached, run detection
+        output_dir.mkdir(exist_ok=True)
+        self.logger.info(f"Running inflammatory cell detection as the file does not exist or force flag is set.")
+        run_inflammatory_cell_detection(
+            wsi_path=wsi_path,
+            output_dir=output_dir,
+            model_path="detection/models/",
+            visualise=visualise
+        )
+
+        # verify after detection
+        if not json_thresholded_path.exists():
+            self.logger.error(f"Detection output file not found at: {json_thresholded_path}")
+            raise FileNotFoundError(f"Inflammatory cell detection JSON file not found at {json_thresholded_path}")
+
+        with open(json_thresholded_path) as f:
+            inflam = json.load(f)
+
+        mm_coords = np.array(
+            [[pt["point"][0], pt["point"][1]] for pt in inflam["points"]],
+            dtype=np.float32,
+        )
+        self.logger.info(f"Detected {len(mm_coords)} inflam_cells after computation.")
 
         return {
             "wsi_name": wsi_name,
-            "inflam_cell_coords_path": str(mm_coords_path),
-            "inflam_cell_pixel_coords_path": str(pixel_coords_path) if pixel_coords_path.exists() else None
+            "prob_threshold": prob_thres,
+            "inflam_cell_coords_path": str(json_thresholded_path),
         }
 
+
     def run_stage3(self, wsi_path: str, force: bool = False) -> dict:
+        import tifffile as tiff
         self.logger.info("Running Stage 3: Quantification of inflammatory cells per tubule")
 
         paths = self.get_output_paths(wsi_path)
@@ -129,11 +165,23 @@ class KidneyGraderPipeline:
         if not paths["tubule_mask"].exists():
             raise FileNotFoundError("Required tubule mask not found.")
 
-        tubule_mask = np.load(paths["tubule_mask"])
-        coords_path = self.detection_dir / paths["wsi_name"] / "inflam_cell_mm_coords.npy"
-        mm_coords = np.load(coords_path)
+        # load  the instance mask, which is memorymapped for large files
+        with tiff.TiffFile(paths["tubule_mask"]) as tif:
+            tubule_mask = tif.asarray(out='memmap')  # Lazy load to avoid memory overload
 
-        # Convert mm → pixel coordinates
+        prob_tag = f"p{self.prob_thres:.2f}".replace(".", "")
+        dist_tag = f"d{self.foci_dist}"
+        json_path = paths["inflam_cell_mask"]
+
+        if not json_path.exists():
+            self.logger.error(f"Expected detection file not found: {json_path}")
+            raise FileNotFoundError(f"Inflammatory cell detection JSON file not found at {json_path}")
+
+        with open(json_path) as f:
+            inflam = json.load(f)
+
+        mm_coords = np.array([[pt["point"][0], pt["point"][1]] for pt in inflam["points"]], dtype=np.float32)
+
         MICRONS_PER_PIXEL = 0.24199951445730394
         cell_coords = (mm_coords * 1000 / MICRONS_PER_PIXEL).astype(np.int32)
 
@@ -143,8 +191,11 @@ class KidneyGraderPipeline:
         self.logger.info(f"[Stage 3] WSI size: {slide.dimensions}")
         self.logger.info(f"[Stage 3] Tubule mask shape: {tubule_mask.shape}")
 
-        foci_mask = identify_foci(tubule_mask, min_distance=200)
+        foci_mask = identify_foci(tubule_mask, min_distance=self.foci_dist)
         counts_df = count_cells_in_tubules(cell_coords, tubule_mask, foci_mask)
+
+        output_dir = self.quantification_dir / f"{paths['wsi_name']}_{prob_tag}_{dist_tag}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         save_counts_csv(counts_df, paths["counts_csv"])
         summary_stats = analyze_tubule_cell_distribution(counts_df)
@@ -165,16 +216,26 @@ class KidneyGraderPipeline:
         self.logger.info(f"Saved structured summary to {paths['quant_json']}")
         return output
 
+
     def run_stage4(self, wsi_path: str, force: bool = False) -> dict:
         import pandas as pd
 
         self.logger.info("Running Stage 4: Grading")
 
         paths = self.get_output_paths(wsi_path)
+
+        prob_tag = f"p{self.prob_thres:.2f}".replace(".", "")
+        dist_tag = f"d{self.foci_dist}"
+
+        # create a grading subdirectory reflecting the parameters
+        grading_output_dir = self.grading_dir / f"{paths['wsi_name']}_{prob_tag}_{dist_tag}"
+        grading_output_dir.mkdir(parents=True, exist_ok=True)
+
         if paths["grading_report"].exists() and not force:
             self.logger.info("Grading already exists. Skipping.")
             with open(paths["grading_report"]) as f:
-                return json.load(f)
+                grading_result = json.load(f)
+                return grading_result
 
         if not paths["counts_csv"].exists():
             raise FileNotFoundError("Required quantification CSV not found. Run Stage 3.")
@@ -185,13 +246,14 @@ class KidneyGraderPipeline:
         # Calculate score using loaded counts
         grading_result = calculate_tubulitis_score(
             counts_df=counts_df,
-            output_dir=self.grading_dir
+            output_dir=grading_output_dir
         )
 
+        self.logger.info(f"Grading report saved to {paths['grading_report']}")
         return {
             "wsi_name": paths["wsi_name"],
             "tubulitis_score": grading_result["score"],
-            "grading_report": grading_result["report_path"]
+            "grading_report": str(paths["grading_report"])
         }
         
     def run_by_stage(self, wsi_path: str, stage: str, force: bool = False, visualise: bool = False) -> Dict[str, Any]:
@@ -233,12 +295,19 @@ def main():
     )
 
     parser.add_argument("--model_path", type=str, 
-        default="checkpoints/improved_unet_best.pth",
+        default="checkpoints/best_current_model.pth",
         help="Path to segmentation model checkpoint"
     )
 
     parser.add_argument("--force", action="store_true", help="Recompute all stages even if outputs exist")
     parser.add_argument("--visualise", action="store_true", help="Visualise segmentation results")
+
+    parser.add_argument("--prob_thres", type=float, default=0.80,
+                        help="Probability threshold (p ≥ value) used for inflammatory‑cell "
+                        "filtering in stages 2 & 3 [default: 0.80]")
+    
+    parser.add_argument("--foci_dist", type=int, default=500,
+                        help="Minimum distance between foci in pixels [default: 500]")
 
     args = parser.parse_args()
 
@@ -251,12 +320,26 @@ def main():
     stage = stage_map.get(args.stage, args.stage)
 
     start = time.time()
-    pipeline = KidneyGraderPipeline(output_dir=args.output_dir, model_path=args.model_path)
+    pipeline = KidneyGraderPipeline(output_dir=args.output_dir, model_path=args.model_path, prob_thres=args.prob_thres, foci_dist=args.foci_dist)
     result = pipeline.run_by_stage(args.input_path, stage, force=args.force, visualise=args.visualise)
     end = time.time()
 
     console.print(f"[bold green]Done in {end - start:.2f} seconds.[/bold green]")
-    console.print(f"[bold yellow]Result:[/bold yellow] {json.dumps(result, indent=2)}")
 
+    if stage in ("3", "quantify"):
+        console.print("[bold yellow]Quantification complete.[/bold yellow]")
+        console.print(
+            f"Total tubules = {result['total_tubules']}, "
+            f"total inflammatory cells = {result['total_inflam_cells']}, "
+            f"mean cells/tubule = {result['summary_stats']['mean_cells_per_tubule']:.1f}"
+        )
+    elif stage in ("4", "grade"):
+        console.print(f"[bold yellow]Grading complete.[/bold yellow]")
+        console.print(f"WSI Name: {result['wsi_name']}")
+        console.print(f"Tubulitis Grade: {result['tubulitis_score']}")
+        console.print(f"Grading Report Path: {result['grading_report']}")
+    else:
+        console.print(f"[bold yellow]Result:[/bold yellow] {json.dumps(result, indent=2)}")
+        
 if __name__ == "__main__":
     main()

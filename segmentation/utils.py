@@ -1,80 +1,97 @@
-import os
-import time
+from uuid import uuid4
 import numpy as np
 from PIL import Image
-import cv2
-from torch.utils.data import Dataset
-from tiffslide import TiffSlide
-from torchvision import transforms
+from tqdm import tqdm
 import torch
-import logging
-from scipy import ndimage
-from skimage.morphology import local_maxima
-from skimage.segmentation import watershed
+from scipy import ndimage as ndi
+from skimage import measure, morphology, segmentation
+from skimage.feature import peak_local_max
 from .improved_unet import ImprovedUNet
 from .config import LABEL_COLOURS, PATCH_SIZE, PATCH_OVERLAP, TISSUE_THRESHOLD, PATCH_LEVEL, NUM_CLASSES
+from typing import Tuple
 
-import numpy as np
-import cv2
-import logging
+# a hybrid approach, combining both connected component labelling and watershed
+def get_instance_mask(
+    mask: np.ndarray,
+    tissue_type: int,
+    *,
+    min_size: int = 64,
+    footprint_radius: int = 20,
+    connectivity: int = 2,
+    dtype_out: np.dtype = np.uint32,
+) -> Tuple[np.ndarray, int]:
 
-import numpy as np
-import cv2
-import logging
-from skimage.measure import label
+    # footprint_radius is a hyperparam - larger radius means fewer markers and less splitting
+    # connectivity is used for the initial coarse labelling (connected component labelling)
 
-def get_instance_mask(mask: np.ndarray, tissue_type: int = 1, downsample_factor: int = 4) -> tuple[np.ndarray, int]:
-    binary = (mask == tissue_type).astype(np.uint8)
+    # quick exit
+    binary = (mask == tissue_type)
+    if not np.any(binary):
+        return np.zeros_like(mask, dtype=dtype_out), 0
 
-    if np.count_nonzero(binary) == 0:
-        return np.zeros_like(binary, dtype=np.uint16), 0
+    # remove specks to speed things up. min_size is smallest valid object size
+    binary = morphology.remove_small_objects(binary, min_size=min_size)
 
-    # morphological opening to remove small objects
-    kernel = np.ones((3, 3), np.uint8)
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    # coarse connected components
+    coarse_labels = measure.label(binary, connectivity=connectivity)
 
-    if np.count_nonzero(opened) == 0:
-        logging.warning("[Watershed-DS] Opened mask is empty.")
-        return np.zeros_like(opened, dtype=np.uint16), 0
+    # initialise, using uint32 gives 16 mill unique ids
+    instance_mask = np.zeros(mask.shape, dtype=dtype_out)
 
-    # downsample for processing
-    if downsample_factor > 1:
-        opened_small = cv2.resize(opened, (
-            opened.shape[1] // downsample_factor,
-            opened.shape[0] // downsample_factor
-        ), interpolation=cv2.INTER_NEAREST)
-    else:
-        opened_small = opened
+    next_id: int = 1  # global label counter
 
-    # distance transform
-    dist = cv2.distanceTransform(opened_small, cv2.DIST_L2, 5).astype(np.float32)
+    # iterate over each blob independently, more optimal for ram
+    footprint = morphology.disk(footprint_radius)
+    for region in measure.regionprops(coarse_labels):
+        # minimal bounding box slice
+        slc_y, slc_x = region.slice
+        blob_mask = binary[slc_y, slc_x]
 
-    _, sure_fg = cv2.threshold(dist, 0.25 * dist.max(), 1, 0)
-    sure_fg = np.uint8(sure_fg)
-    sure_bg = cv2.dilate(opened_small, kernel, iterations=3)
-    unknown = cv2.subtract(sure_bg, sure_fg)
+        # distance map inside the blob
+        dist = ndi.distance_transform_edt(blob_mask)
 
-    _, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 1] = 0
+        # find seed points (local maxima of distance)
+        # footprint defines minimum separation between peaks
+        try:
+            coords = peak_local_max(
+                dist, footprint=footprint, labels=blob_mask, exclude_border=False
+            )
+            peaks = np.zeros_like(blob_mask, dtype=bool)
+            if coords.size: # avoid empty peak array
+                peaks[tuple(coords.T)] = True
+        except TypeError:  # old api
+            peaks = peak_local_max(
+                dist, footprint=footprint, labels=blob_mask,
+                indices=False, exclude_border=False
+            )
 
-    color_img = cv2.cvtColor((opened_small * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-    markers = cv2.watershed(color_img, markers)
+        # fallback, if watershed would fail (rare, flat small blob) use CC
+        markers, _ = ndi.label(peaks)
+        if markers.max() == 0:                   # tiny flat blob fallback
+            markers = measure.label(blob_mask)
 
-    labels = np.where(markers > 1, markers - 1, 0).astype(np.uint16)
-
-    # upsample to original size
-    if downsample_factor > 1:
-        instance_mask = cv2.resize(
-            labels,
-            (mask.shape[1], mask.shape[0]),
-            interpolation=cv2.INTER_NEAREST
+        # marker‑controlled watershed to split touching objects
+        labels_ws = segmentation.watershed(
+            -dist,
+            markers,
+            mask=blob_mask,
+            connectivity=connectivity
         )
-    else:
-        instance_mask = labels
 
-    num_instances = instance_mask.max()
-    logging.info(f"Found {num_instances} instances for tissue type {tissue_type}")
+        # write labels back into global array with offset
+        if labels_ws.max() > 0:
+            instance_mask_view = instance_mask[slc_y, slc_x]
+            instance_ids = np.unique(labels_ws)
+            instance_ids = instance_ids[instance_ids > 0]  # skip background
+
+            for lab in instance_ids:
+                instance_mask_view[labels_ws == lab] = next_id
+                next_id += 1
+
+        # cleanup
+        del dist, peaks, markers, labels_ws
+
+    num_instances = next_id - 1
     return instance_mask, num_instances
 
 

@@ -4,6 +4,7 @@ import tempfile
 import json
 import cv2
 from tiffslide import TiffSlide
+import copy
 
 import numpy as np
 
@@ -57,6 +58,30 @@ def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path:
         inflammatory_cells = json.load(f)
 
     coords = np.array([[p["point"][0], p["point"][1]] for p in inflammatory_cells["points"]])
+
+    threshold_list = [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]       # probabilities to keep
+    for thr in threshold_list:
+        # keep only points whose probability ≥ thr
+        filtered_points = [
+            pt for pt in inflammatory_cells["points"]
+            if pt.get("probability", 0.0) >= thr
+        ]
+
+        # skip empty results to avoid writing empty files
+        if not filtered_points:
+            continue
+
+        filtered_dict = copy.deepcopy(inflammatory_cells)
+        filtered_dict["points"] = filtered_points
+
+        # build filename like: detected-inflammatory-cells-p02.json
+        thr_tag = f"{thr:.2f}".replace(".", "") # 0.2 is “02”, 0.3 is “03”, etc
+        out_path = output_dir / f"detected-inflammatory-cells-p{thr_tag}.json"
+
+        with open(out_path, "w") as f_out:
+            json.dump(filtered_dict, f_out, indent=4)
+
+        print(f"Saved filtered inflammatory cells (p ≥ {thr}) to {out_path}")
 
     if visualise:
         slide = TiffSlide(wsi_path)

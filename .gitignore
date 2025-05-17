@@ -30,6 +30,7 @@ test/
 *.json
 *.png
 *.tiff
+*.txt
 
 # temp/debug
 tmp/

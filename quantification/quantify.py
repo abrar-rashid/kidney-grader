@@ -3,29 +3,30 @@ import pandas as pd
 from pathlib import Path
 import logging
 from tqdm import tqdm
+from skimage.measure import regionprops_table
 
 from skimage.measure import regionprops
 
-def count_cells_in_tubules(nuclei_coords, instance_mask, foci_mask):
+def count_cells_in_tubules(cell_coords, instance_mask, foci_mask):
     # for each tubule, record its cell count, position, and ids of itself and the focus it is assigned to.
 
-    if len(nuclei_coords) == 0:
+    if len(cell_coords) == 0:
         return pd.DataFrame(columns=['tubule_id', 'x', 'y', 'cell_count', 'focus_id'])
 
-    nuclei_coords = nuclei_coords.astype(int)
-    nuclei_y, nuclei_x = nuclei_coords[:, 0], nuclei_coords[:, 1]
+    cell_coords = cell_coords.astype(int)
+    cells_y, cells_x = cell_coords[:, 0], cell_coords[:, 1]
 
     h, w = instance_mask.shape
-    valid_mask = (nuclei_y >= 0) & (nuclei_y < h) & (nuclei_x >= 0) & (nuclei_x < w)
-    nuclei_y = nuclei_y[valid_mask]
-    nuclei_x = nuclei_x[valid_mask]
+    valid_mask = (cells_y >= 0) & (cells_y < h) & (cells_x >= 0) & (cells_x < w)
+    cells_y = cells_y[valid_mask]
+    cells_x = cells_x[valid_mask]
 
     # get tubule label for each nucleus
-    tubule_ids = instance_mask[nuclei_y, nuclei_x]
+    tubule_ids = instance_mask[cells_y, cells_x]
     valid_mask = tubule_ids > 0
     tubule_ids = tubule_ids[valid_mask]
-    nuclei_y = nuclei_y[valid_mask]
-    nuclei_x = nuclei_x[valid_mask]
+    cells_y = cells_y[valid_mask]
+    cells_x = cells_x[valid_mask]
 
     # count how many cells fall in each tubule
     unique_ids, counts = np.unique(tubule_ids, return_counts=True)

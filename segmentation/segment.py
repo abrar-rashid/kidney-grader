@@ -325,7 +325,7 @@ def run_segment(in_data, model_path=DEFAULT_SEGMENTATION_MODEL_PATH,
     # check if input is a file path or a tensor
     if isinstance(in_data, str):
         wsi_name = Path(in_data).stem
-        output_dir = Path(output_dir) / wsi_name
+        output_dir = Path(output_dir)
 
         if in_data.lower().endswith(('.svs', '.tif', '.tiff')):
             logging.info(f"Segmenting WSI: {in_data}")

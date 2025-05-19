@@ -154,6 +154,7 @@ partd==1.4.2
 pexpect==4.9.0
 pillow==11.0.0
 platformdirs==4.3.7
+prettytable==3.16.0
 prometheus_client==0.21.1
 prompt_toolkit==3.0.51
 propcache==0.3.1
@@ -220,6 +221,7 @@ tinycss2==1.4.0
 tomli==2.2.1
 toolz==1.0.0
 torch==2.5.1
+torchsummary==1.5.1
 torchvision==0.20.1
 tornado==6.4.2
 tqdm==4.67.1

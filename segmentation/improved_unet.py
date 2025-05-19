@@ -1,3 +1,4 @@
+from segmentation.config import NUM_CLASSES
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -153,3 +154,49 @@ class ImprovedUNet(nn.Module):
             return out, ds_outputs, self.class_weights
         else:
             return out
+
+
+# import torch
+# from torchsummary import summary
+# from prettytable import PrettyTable
+
+# def model_analysis(model, input_size=(3, 224, 224)):
+#     print("\n=== Model Summary ===")
+#     try:
+#         summary(model, input_size)
+#     except Exception as e:
+#         print(f"Error in model summary: {e}")
+
+#     print("\n=== Detailed Layer Information ===")
+#     table = PrettyTable(["Layer", "Type", "Shape", "Param #"])
+
+#     total_params = 0
+#     trainable_params = 0
+
+#     for name, param in model.named_parameters():
+#         layer_type = param.__class__.__name__
+#         shape = list(param.shape)
+#         num_params = param.numel()
+#         total_params += num_params
+#         if param.requires_grad:
+#             trainable_params += num_params
+#         table.add_row([name, layer_type, str(shape), num_params])
+
+#     print(table)
+#     print(f"\nTotal Parameters: {total_params:,}")
+#     print(f"Trainable Parameters: {trainable_params:,}")
+#     print(f"Non-trainable Parameters: {total_params - trainable_params:,}")
+
+#     print("\n=== Layer Types Count ===")
+#     from collections import Counter
+#     layer_types = [type(layer).__name__ for layer in model.modules()]
+#     layer_count = Counter(layer_types)
+#     for layer_type, count in layer_count.items():
+#         print(f"{layer_type}: {count}")
+
+#     print("\n=== Model Architecture ===")
+#     print(model)
+
+# # Example usage:
+# model = ImprovedUNet(n_classes=NUM_CLASSES)
+# model_analysis(model)

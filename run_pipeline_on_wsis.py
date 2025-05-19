@@ -322,7 +322,41 @@ def run_pipeline(force_rerun=False, visualize=False):
             # Track this WSI
             results_tracker["processed_wsis"].add(wsi_name)
             
-            # Process with each parameter combination
+            # First, run segmentation and detection stages only once per WSI - they're parameter independent
+            # Check if segmentation and detection need to be run
+            segmentation_dir = OUTPUT_DIR / "individual_reports" / wsi_name / "segmentation"
+            detection_dir = OUTPUT_DIR / "individual_reports" / wsi_name / "detection"
+            segmentation_file = segmentation_dir / f"{wsi_name}_full_instance_mask_class1.tiff"
+            detection_file = detection_dir / "detected-inflammatory-cells.json"
+            
+            if force_rerun or not segmentation_file.exists() or not detection_file.exists():
+                console.print(f"[blue]Running segmentation and detection for {wsi_name} ({wsi_idx+1}/{len(wsi_files)})[/blue]")
+                
+                # Run segmentation and detection only (stages 1,2)
+                command = [
+                    "python3", "main.py",
+                    "--input_path", str(wsi_path),
+                    "--output_dir", str(OUTPUT_DIR),
+                    "--stage", "1,2",  # Only run segmentation and detection
+                ]
+                
+                # Add visualize flag if requested
+                if visualize:
+                    command.append("--visualise")
+                
+                success = run_subprocess_with_output(
+                    command,
+                    wsi_name,
+                    "segmentation+detection"
+                )
+                
+                if not success:
+                    console.print(f"[red]Error in segmentation/detection for {wsi_name}. Skipping this WSI.[/red]")
+                    continue
+            else:
+                console.print(f"[green]Segmentation and detection already completed for {wsi_name}. Skipping to quantification.[/green]")
+            
+            # Now run quantification and grading with each parameter combination
             for param_idx, (prob_thres, foci_dist) in enumerate(parameter_combinations):
                 param_tag = f"p{prob_thres:.2f}".replace('.', '') + f"_d{foci_dist}"
                 
@@ -340,16 +374,12 @@ def run_pipeline(force_rerun=False, visualize=False):
                     # Show current processing stage
                     console.print(f"[blue]Processing {wsi_name} ({wsi_idx+1}/{len(wsi_files)}) with {param_tag} ({param_idx+1}/{len(parameter_combinations)})[/blue]")
                     
-                    # Run the pipeline for this combination
-                    console.print(f"[dim cyan]Stage: Starting main.py...[/dim cyan]")
-                    
-                    # Run subprocess and stream output in real-time
-                    # Run quantification and grading in a single command with the new comma-separated format
+                    # Run quantification and grading in a single command (stages 3,4)
                     command = [
                         "python3", "main.py",
                         "--input_path", str(wsi_path),
                         "--output_dir", str(OUTPUT_DIR),
-                        "--stage", "all",
+                        "--stage", "3,4",  # Only run quantification and grading
                         "--prob_thres", str(prob_thres),
                         "--foci_dist", str(foci_dist),
                     ]
@@ -851,6 +881,7 @@ def show_live_stats():
     
     # Prepare metrics if ground truth is available
     metrics_table = None
+    best_params_table = None
     results_df = pd.DataFrame(results_tracker["results"])
     
     if "true_score" in results_df.columns and not results_df["true_score"].isna().all():
@@ -875,6 +906,39 @@ def show_live_stats():
             metrics_table.add_row("RMSE", f"{rmse:.4f}")
             metrics_table.add_row("R²", f"{r2:.4f}")
             metrics_table.add_row("Accuracy", f"{accuracy:.2%}")
+            
+            # Find best parameter combination
+            if len(valid_results) > 10:  # Only if we have enough data
+                try:
+                    param_metrics = valid_results.groupby(["prob_thres", "foci_dist"]).apply(
+                        lambda x: pd.Series({
+                            "mae": mean_absolute_error(x["true_score"], x["predicted_score"]),
+                            "rmse": np.sqrt(mean_squared_error(x["true_score"], x["predicted_score"])),
+                            "r2": r2_score(x["true_score"], x["predicted_score"]) if len(x) > 1 else 0,
+                            "accuracy": np.mean(x["correct"]) if "correct" in x.columns else 0,
+                            "count": len(x)
+                        })
+                    ).reset_index()
+                    
+                    # Sort by MAE (lower is better)
+                    if not param_metrics.empty:
+                        param_metrics = param_metrics.sort_values("mae")
+                        best_row = param_metrics.iloc[0]
+                        
+                        # Create best parameters table
+                        best_params_table = Table(title="Best Parameter Combination")
+                        best_params_table.add_column("Parameter", style="cyan")
+                        best_params_table.add_column("Value", style="green")
+                        
+                        best_params_table.add_row("Probability Threshold", f"{best_row['prob_thres']}")
+                        best_params_table.add_row("Foci Distance", f"{best_row['foci_dist']}")
+                        best_params_table.add_row("MAE", f"{best_row['mae']:.4f}")
+                        best_params_table.add_row("RMSE", f"{best_row['rmse']:.4f}")
+                        best_params_table.add_row("R²", f"{best_row['r2']:.4f}")
+                        best_params_table.add_row("Accuracy", f"{best_row['accuracy']:.2%}")
+                        best_params_table.add_row("Sample Count", f"{best_row['count']}")
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Could not calculate best parameters: {e}[/yellow]")
     
     # Create progress table
     progress_table = Table(title="Processing Progress")
@@ -906,6 +970,9 @@ def show_live_stats():
     
     if metrics_table:
         console.print(metrics_table)
+    
+    if best_params_table:
+        console.print(best_params_table)
         
     console.print(t_table)
     console.print("\n")

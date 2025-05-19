@@ -49,18 +49,21 @@ echo "Starting tmux sessions..."
 # GPU 0
 tmux new-session -d -s kidney_gpu0
 tmux send-keys -t kidney_gpu0 "cd ${BASE_DIR}" C-m
+tmux send-keys -t kidney_gpu0 "source .kg_env/bin/activate" C-m
 tmux send-keys -t kidney_gpu0 "echo 'Starting GPU 0 processing on ${GPU0_INPUT}'" C-m
 tmux send-keys -t kidney_gpu0 "CUDA_VISIBLE_DEVICES=0 python run_pipeline_on_wsis_gpu0.py --output_dir ${GPU0_OUTPUT} --clear-checkpoint" C-m
 
 # GPU 1
 tmux new-session -d -s kidney_gpu1
 tmux send-keys -t kidney_gpu1 "cd ${BASE_DIR}" C-m
+tmux send-keys -t kidney_gpu1 "source .kg_env/bin/activate" C-m
 tmux send-keys -t kidney_gpu1 "echo 'Starting GPU 1 processing on ${GPU1_INPUT}'" C-m
 tmux send-keys -t kidney_gpu1 "CUDA_VISIBLE_DEVICES=1 python run_pipeline_on_wsis_gpu1.py --output_dir ${GPU1_OUTPUT} --clear-checkpoint" C-m
 
 # GPU 2
 tmux new-session -d -s kidney_gpu2
 tmux send-keys -t kidney_gpu2 "cd ${BASE_DIR}" C-m
+tmux send-keys -t kidney_gpu2 "source .kg_env/bin/activate" C-m
 tmux send-keys -t kidney_gpu2 "echo 'Starting GPU 2 processing on ${GPU2_INPUT}'" C-m
 tmux send-keys -t kidney_gpu2 "CUDA_VISIBLE_DEVICES=2 python run_pipeline_on_wsis_gpu2.py --output_dir ${GPU2_OUTPUT} --clear-checkpoint" C-m
 

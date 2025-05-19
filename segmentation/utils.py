@@ -29,9 +29,6 @@ def get_instance_mask(
     if not np.any(binary):
         return np.zeros_like(mask, dtype=dtype_out), 0
 
-    # remove specks to speed things up. min_size is smallest valid object size
-    binary = morphology.remove_small_objects(binary, min_size=min_size)
-
     # coarse connected components
     coarse_labels = measure.label(binary, connectivity=connectivity)
 
@@ -43,6 +40,9 @@ def get_instance_mask(
     # iterate over each blob independently, more optimal for ram
     footprint = morphology.disk(footprint_radius)
     for region in measure.regionprops(coarse_labels):
+        # remove specks to speed things up. min_size is smallest valid object size in pixels
+        if region.area < min_size:
+            continue
         # minimal bounding box slice
         slc_y, slc_x = region.slice
         blob_mask = binary[slc_y, slc_x]

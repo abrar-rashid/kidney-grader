@@ -922,6 +922,82 @@ class KidneyGraderPipeline:
         
         plt.close()
         
+        # 6. Specific analysis of mean inflammatory cells per tubule vs tubulitis score
+        if 'mean_cells_per_tubule' in eval_df.columns:
+            plt.figure(figsize=(12, 10))
+            
+            # Create scatter plot with regression line
+            plt.subplot(2, 1, 1)
+            sns.regplot(
+                data=eval_df, 
+                x='mean_cells_per_tubule', 
+                y='tubulitis_score_ground_truth_numeric',
+                scatter_kws={'alpha': 0.7},
+                line_kws={'color': 'red'}
+            )
+            
+            # Calculate correlation
+            try:
+                if len(eval_df) >= 2 and eval_df['mean_cells_per_tubule'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        eval_df['mean_cells_per_tubule'], 
+                        eval_df['tubulitis_score_ground_truth_numeric']
+                    )
+                    spearman_r, spearman_p = spearmanr(
+                        eval_df['mean_cells_per_tubule'], 
+                        eval_df['tubulitis_score_ground_truth_numeric']
+                    )
+                    
+                    plt.title(f'Mean Cells per Tubule vs Ground Truth T-score\n'
+                             f'Pearson r={pearson_r:.3f} (p={p_value:.4f}), '
+                             f'Spearman r={spearman_r:.3f} (p={spearman_p:.4f})')
+                else:
+                    plt.title('Mean Cells per Tubule vs Ground Truth T-score\n'
+                             'Not enough data variation for correlation calculation')
+            except Exception as e:
+                self.logger.warning(f"Error calculating correlation for mean_cells_per_tubule: {e}")
+                plt.title('Mean Cells per Tubule vs Ground Truth T-score')
+            
+            plt.xlabel('Mean Inflammatory Cells per Tubule')
+            plt.ylabel('Ground Truth T-score')
+            plt.grid(True, alpha=0.3)
+            
+            # Create box plot to show distribution by T-score
+            plt.subplot(2, 1, 2)
+            
+            # Ensure T-score is formatted correctly for the box plot
+            eval_df['t_score_category'] = eval_df['tubulitis_score_ground_truth_numeric'].round().astype(int).map(lambda x: f't{x}')
+            
+            # Create box plot
+            sns.boxplot(data=eval_df, x='t_score_category', y='mean_cells_per_tubule')
+            plt.title('Distribution of Mean Cells per Tubule by T-score')
+            plt.xlabel('T-score')
+            plt.ylabel('Mean Inflammatory Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save the plots
+            cells_vs_tscore_path = self.summary_dir / "mean_cells_vs_tscore.png"
+            plt.savefig(cells_vs_tscore_path)
+            plt.savefig(version_dir / "mean_cells_vs_tscore.png")
+            
+            # Save the data points for this specific relationship
+            cells_vs_tscore_data = eval_df[['wsi_name', 'mean_cells_per_tubule', 
+                                           'tubulitis_score_ground_truth', 
+                                           'tubulitis_score_ground_truth_numeric',
+                                           'tubulitis_score_predicted',
+                                           'prob_thres', 'foci_dist']]
+            cells_vs_tscore_path_csv = self.summary_dir / "mean_cells_vs_tscore.csv"
+            cells_vs_tscore_data.to_csv(cells_vs_tscore_path_csv, index=False)
+            cells_vs_tscore_data.to_csv(version_dir / "mean_cells_vs_tscore.csv", index=False)
+            
+            self.logger.info(f"Saved mean cells per tubule vs T-score analysis to {cells_vs_tscore_path}")
+        else:
+            self.logger.warning("No 'mean_cells_per_tubule' feature available - skipping specific analysis")
+        
+        plt.close()
+        
         # Create a README for the version directory
         with open(version_dir / "README.txt", "w") as f:
             f.write(f"Summary analysis created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")

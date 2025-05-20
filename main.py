@@ -31,7 +31,7 @@ def setup_logging(output_dir: Path) -> None:
 class KidneyGraderPipeline:
     # Main pipeline for kidney biopsy grading
     
-    def __init__(self, output_dir: str, model_path: str = "checkpoints/best_current_model.pth", prob_thres: float = 0.80, foci_dist = 500, custom_detection_json: str = None, custom_instance_mask_class1: str = None, custom_instance_mask_class4: str = None):
+    def __init__(self, output_dir: str, model_path: str = "checkpoints/best_current_model.pth", prob_thres: float = 0.80, foci_dist = 200, custom_detection_json: str = None, custom_instance_mask_class1: str = None, custom_instance_mask_class4: str = None):
         self.output_dir = Path(output_dir)
         self.model_path = model_path
         self.prob_thres = prob_thres
@@ -1302,8 +1302,8 @@ def main():
                         help="Probability threshold (p ≥ value) used for inflammatory‑cell "
                         "filtering in stages 2 & 3 [default: 0.80]")
     
-    parser.add_argument("--foci_dist", type=int, default=500,
-                        help="Minimum distance between foci in pixels [default: 500]")
+    parser.add_argument("--foci_dist", type=int, default=200,
+                        help="Minimum distance between foci in pixels [default: 200]")
                         
     parser.add_argument("--update_summary", action="store_true",
                         help="Update summary files after processing")

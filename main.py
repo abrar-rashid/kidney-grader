@@ -31,11 +31,14 @@ def setup_logging(output_dir: Path) -> None:
 class KidneyGraderPipeline:
     # Main pipeline for kidney biopsy grading
     
-    def __init__(self, output_dir: str, model_path: str = "checkpoints/best_current_model.pth", prob_thres: float = 0.80, foci_dist = 500):
+    def __init__(self, output_dir: str, model_path: str = "checkpoints/best_current_model.pth", prob_thres: float = 0.80, foci_dist = 200, custom_detection_json: str = None, custom_instance_mask_class1: str = None, custom_instance_mask_class4: str = None):
         self.output_dir = Path(output_dir)
         self.model_path = model_path
         self.prob_thres = prob_thres
         self.foci_dist = foci_dist
+        self.custom_detection_json = custom_detection_json
+        self.custom_instance_mask_class1 = custom_instance_mask_class1
+        self.custom_instance_mask_class4 = custom_instance_mask_class4
 
         setup_logging(self.output_dir)
         self.logger = logging.getLogger(__name__)
@@ -110,6 +113,46 @@ class KidneyGraderPipeline:
         instance_mask_path1 = output_dir / f"{wsi_name}_full_instance_mask_class1.tiff"
         instance_mask_path4 = output_dir / f"{wsi_name}_full_instance_mask_class4.tiff"
 
+        # Check if custom instance masks are provided
+        custom_masks_used = False
+        if self.custom_instance_mask_class1 and self.custom_instance_mask_class4:
+            output_dir.mkdir(exist_ok=True)
+            
+            # Handle custom class 1 instance mask (tubules)
+            custom_mask_path1 = Path(self.custom_instance_mask_class1)
+            custom_mask_path4 = Path(self.custom_instance_mask_class4)
+            
+            # Check if both files exist
+            if custom_mask_path1.exists() and custom_mask_path4.exists():
+                self.logger.info(f"Using custom instance masks:")
+                self.logger.info(f"  - Class 1 (tubules): {custom_mask_path1}")
+                self.logger.info(f"  - Class 4 (glomeruli): {custom_mask_path4}")
+                
+                # Copy both files
+                import shutil
+                shutil.copy(custom_mask_path1, instance_mask_path1)
+                shutil.copy(custom_mask_path4, instance_mask_path4)
+                custom_masks_used = True
+                
+                # Return early with custom masks
+                instance_mask_paths = {
+                    1: str(instance_mask_path1),
+                    4: str(instance_mask_path4)
+                }
+                return {
+                    "semantic_mask_path": str(semantic_mask_path) if semantic_mask_path.exists() else None,
+                    "instance_mask_paths": instance_mask_paths,
+                    "custom_masks": True
+                }
+            else:
+                missing_files = []
+                if not custom_mask_path1.exists():
+                    missing_files.append(f"Class 1 mask: {custom_mask_path1}")
+                if not custom_mask_path4.exists():
+                    missing_files.append(f"Class 4 mask: {custom_mask_path4}")
+                    
+                self.logger.warning(f"Custom instance masks not found: {', '.join(missing_files)}. Will run segmentation.")
+
         # check if both instance masks exist before skipping
         if instance_mask_path1.exists() and instance_mask_path4.exists() and not force:
             self.logger.info(f"Segmentation mask already exists at {output_dir}, skipping segmentation.")
@@ -138,6 +181,47 @@ class KidneyGraderPipeline:
         output_dir = self.individual_reports_dir / wsi_name / "detection"
         
         json_detection_path = output_dir / "detected-inflammatory-cells.json"
+
+        # If custom detection JSON is provided, use it instead
+        if self.custom_detection_json:
+            custom_json_path = Path(self.custom_detection_json)
+            if custom_json_path.exists():
+                self.logger.info(f"Using custom detection JSON from {custom_json_path}")
+                output_dir.mkdir(exist_ok=True)
+                
+                # Copy the custom JSON to the expected location
+                import shutil
+                shutil.copy(custom_json_path, json_detection_path)
+                
+                with open(json_detection_path) as f:
+                    inflam = json.load(f)
+
+                # Load all points first
+                all_points = inflam["points"]
+                total_points = len(all_points)
+                
+                # Filter points based on probability threshold
+                filtered_points = [
+                    pt for pt in all_points 
+                    if "probability" in pt and pt["probability"] >= self.prob_thres
+                ]
+                
+                # Extract coordinates from filtered points
+                mm_coords = np.array(
+                    [[pt["point"][0], pt["point"][1]] for pt in filtered_points],
+                    dtype=np.float32,
+                )
+                
+                self.logger.info(f"Filtered inflammatory cells from {total_points} to {len(filtered_points)} using threshold {self.prob_thres}")
+                
+                return {
+                    "wsi_name": wsi_name,
+                    "prob_threshold": self.prob_thres,
+                    "inflam_cell_coords_path": str(json_detection_path),
+                    "custom_detection": True
+                }
+            else:
+                self.logger.warning(f"Custom detection JSON {custom_json_path} not found. Falling back to standard detection.")
 
         # check if file exists and log the details
         self.logger.info(f"Checking if detection file exists at: {json_detection_path}")
@@ -1218,27 +1302,54 @@ def main():
                         help="Probability threshold (p ≥ value) used for inflammatory‑cell "
                         "filtering in stages 2 & 3 [default: 0.80]")
     
-    parser.add_argument("--foci_dist", type=int, default=500,
-                        help="Minimum distance between foci in pixels [default: 500]")
+    parser.add_argument("--foci_dist", type=int, default=200,
+                        help="Minimum distance between foci in pixels [default: 200]")
                         
     parser.add_argument("--update_summary", action="store_true",
                         help="Update summary files after processing")
                         
     parser.add_argument("--summary_only", action="store_true",
                         help="Only regenerate summary files without processing any WSIs")
+                        
+    parser.add_argument("--detection_json", type=str, default=None,
+                        help="Path to a custom inflammatory cell detection JSON file to use instead of running detection")
+                        
+    parser.add_argument("--instance_mask_class1", type=str, default=None,
+                        help="Path to a custom instance mask for class 1 (tubules) to use instead of running segmentation")
+                        
+    parser.add_argument("--instance_mask_class4", type=str, default=None,
+                        help="Path to a custom instance mask for class 4 (glomeruli) to use instead of running segmentation")
 
     args = parser.parse_args()
+
+    # Validate that both instance masks are provided if either one is specified
+    if (args.instance_mask_class1 and not args.instance_mask_class4) or (args.instance_mask_class4 and not args.instance_mask_class1):
+        parser.error("Both --instance_mask_class1 and --instance_mask_class4 must be provided together")
 
     console.print("[bold cyan]KidneyGrader Pipeline Starting...[/bold cyan]")
     console.print(f"[green]Input:[/green] {args.input_path}")
     console.print(f"[green]Stage:[/green] {args.stage}")
     console.print(f"[green]Output directory:[/green] {args.output_dir}")
+    if args.detection_json:
+        console.print(f"[green]Using custom detection JSON:[/green] {args.detection_json}")
+    if args.instance_mask_class1 and args.instance_mask_class4:
+        console.print(f"[green]Using custom instance masks:[/green]")
+        console.print(f"  - Class 1 (tubules): {args.instance_mask_class1}")
+        console.print(f"  - Class 4 (glomeruli): {args.instance_mask_class4}")
 
     stage_map = {"segment": "1", "detect": "2", "quantify": "3", "grade": "4"}
     stage = stage_map.get(args.stage, args.stage)
 
     start = time.time()
-    pipeline = KidneyGraderPipeline(output_dir=args.output_dir, model_path=args.model_path, prob_thres=args.prob_thres, foci_dist=args.foci_dist)
+    pipeline = KidneyGraderPipeline(
+        output_dir=args.output_dir, 
+        model_path=args.model_path, 
+        prob_thres=args.prob_thres, 
+        foci_dist=args.foci_dist,
+        custom_detection_json=args.detection_json,
+        custom_instance_mask_class1=args.instance_mask_class1,
+        custom_instance_mask_class4=args.instance_mask_class4
+    )
     
     # Handle summary-only mode
     if args.summary_only:

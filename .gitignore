@@ -39,6 +39,8 @@ tmp/
 *.bak
 *.swp
 
+*/wandb
+
 # system files
 Thumbs.db
 .DS_Store

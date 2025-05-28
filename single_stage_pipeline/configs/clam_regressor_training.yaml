@@ -1,0 +1,81 @@
+model:
+  name: "CLAM"
+  task: "regression"
+  
+  clam:
+    gate: true # attention gating for feature selection
+    size_arg: "small"
+    dropout: 0.5 # aggressive, to prevent overfitting on this small dataset
+    k_sample: 32
+    instance_loss_fn: "svm"
+    
+  feature_dim: 1024  # UNI feature dimension
+  hidden_dim: 128
+  num_classes: 1
+
+training:
+  lr: 0.00005
+  weight_decay: 0.01 # strong L2 regularization
+  optimizer: "adam"
+  scheduler: "cosine"
+  
+  epochs: 300 
+  early_stopping_patience: 30
+  
+  loss_fn: "mse"
+  
+  bag_loss_weight: 0.8 
+  instance_loss_weight: 0.2
+
+data:
+  features_dir: "./data/features"
+  labels_file: "../banff_scores.csv"
+  target_column: "T"
+  
+  #cross validation strategy
+  split:
+    method: "stratified"
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+    random_seed: 42
+    
+  batch_size: 1
+  num_workers: 4
+  patch_augmentation: true
+
+validation:
+  metrics: ["mse", "mae", "r2", "pearson_correlation"]
+  save_predictions: true
+  monitor: "val_mse"
+  mode: "min"
+
+checkpoint:
+  save_dir: "./checkpoints_regressor"
+  save_best_only: false
+  save_every_n_epochs: 10
+  monitor: "val_mse"
+  mode: "min"
+
+logging:
+  use_wandb: true
+  project_name: "kidney_tubulitis_regressor"
+  log_interval: 5
+
+hardware:
+  device: "cuda:2"
+  mixed_precision: false
+  compile_model: false
+
+random_seed: 42
+
+advanced:
+  gradient_clip_value: 1.0
+  label_smoothing: 0.1
+  ensemble_models: 5  # train 5 models with different seeds
+  use_cross_validation: true
+  cv_folds: 5
+  patch_augmentation:
+    noise_std: 0.02
+    dropout_rate: 0.1
+    rotation_prob: 0.3

@@ -1,0 +1,55 @@
+# Patch extraction config for the 93 kidney biopsy wsi dataset
+
+data:
+  wsi_dir: "../../all_wsis"
+  labels_file: "../banff_scores.csv"
+  output_dir: "./data/patches" # location to save extracted patches
+  features_dir: "./data/features" # location to save extracted features
+  target_column: "T"  # target column for tubulitis scores (0.0-3.0)
+  
+  split:
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+    random_seed: 42
+  
+patch_extraction:
+  patch_size: 512
+  magnification_level: 0
+  overlap: 0.25
+  tissue_threshold: 0.05
+  max_patches_per_wsi: 10000
+  
+sampling:
+  strategy: "contiguous"
+  extraction_mode: "contiguous"
+  random_seed: 42
+  overlap: 0.25
+  
+  # tubular_focused:
+  #   use_segmentation_masks: false 
+  #   tubular_mask_dir: null 
+  #   focus_ratio: 0.7 
+  #   extraction_mode: "random"
+  
+quality_control:
+  min_tissue_area: 50000
+  blur_threshold: 30
+  saturation_threshold: 15
+  
+processing:
+  num_workers: 8
+  batch_size: 32
+  save_patches: false
+  save_coordinates: true
+  
+feature_extraction:
+  model: "UNI"
+  batch_size: 64
+  device: "cuda"
+  precision: "fp16"
+  
+  pas_optimization:
+    enable: true 
+    color_normalization: "macenko"
+    stain_augmentation: true

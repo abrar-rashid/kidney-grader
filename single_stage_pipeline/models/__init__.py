@@ -1,8 +1,9 @@
-from .clam_regressor import create_clam_regressor
-# from .clam_classifier import create_clam_classifier, print_probability_interpretation
+from .clam_base import CLAM, CLAMAttention, CLAMGatedAttention
+from .clam_regressor import CLAMRegressor, create_clam_regressor
+from .clam_classifier import CLAMClassifier, create_clam_classifier, OrdinalLoss
 
 __all__ = [
-    'create_clam_regressor',
-    'create_clam_classifier',
-    'print_probability_interpretation'
+    'CLAM', 'CLAMAttention', 'CLAMGatedAttention',
+    'CLAMRegressor', 'create_clam_regressor', 
+    'CLAMClassifier', 'create_clam_classifier', 'OrdinalLoss'
 ] 

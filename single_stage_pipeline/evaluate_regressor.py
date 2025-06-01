@@ -13,6 +13,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr, spearmanr
 import warnings
 import argparse
+from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -279,18 +280,378 @@ class CLAMRegressorEvaluator:
         return metrics_df
 
 
+def create_test_only_loader(
+    features_dir: str,
+    labels_file: str,
+    split_file: str,
+    config: Dict[str, Any]
+) -> torch.utils.data.DataLoader:
+    from training.dataset import WSIFeaturesDataset, collate_fn
+    
+    data_config = config['data']
+    
+    test_dataset = WSIFeaturesDataset(
+        features_dir=features_dir,
+        labels_file=labels_file,
+        split_file=split_file,
+        split_name='test',
+        target_column=data_config['target_column'],
+        max_patches=None,
+        augment=False
+    )
+    
+    print(f"Test dataset: {len(test_dataset)} slides")
+    print(f"Test label distribution: {test_dataset.get_label_distribution()}")
+    
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=data_config['batch_size'],
+        shuffle=False,
+        num_workers=data_config['num_workers'],
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+    
+    return test_loader
+
+
+def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output_dir: str = None) -> Dict[str, Any]:
+    print("="*60)
+    print("EVALUATING REGRESSOR ON HELD-OUT TEST SET")
+    print("="*60)
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # load holdout split
+    features_dir = config['data']['features_dir']
+    holdout_file = Path(features_dir) / 'splits' / 'holdout_split_regressor.json'
+    
+    if not holdout_file.exists():
+        raise FileNotFoundError(f"Holdout split file not found: {holdout_file}")
+    
+    with open(holdout_file, 'r') as f:
+        holdout_split = json.load(f)
+    
+    test_slides = holdout_split['test']
+    print(f"Evaluating on {len(test_slides)} held-out test slides")
+    
+    # create test data loader
+    test_split = {
+        'train': [],
+        'val': [],
+        'test': test_slides
+    }
+    
+    temp_split_file = Path(features_dir) / 'splits' / 'temp_holdout_test_regressor.json'
+    with open(temp_split_file, 'w') as f:
+        json.dump(test_split, f, indent=2)
+    
+    try:
+        test_loader = create_test_only_loader(
+            features_dir, config['data']['labels_file'], str(temp_split_file), config
+        )
+
+        device = torch.device(config['hardware']['device'])
+        model = create_clam_regressor(config).to(device)
+        
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        print(f"Loaded model from: {model_path}")
+        print(f"Model trained for {checkpoint['epoch']} epochs")
+        
+        all_predictions = []
+        all_targets = []
+        slide_names = []
+        
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Evaluating"):
+                features = batch['features'].to(device)
+                labels = batch['labels'].to(device)
+                
+                results = model(features)
+                preds = results['logits'].squeeze()
+                
+                preds_np = preds.cpu().numpy()
+                labels_np = labels.cpu().numpy()
+                
+                if len(preds_np.shape) == 0:
+                    preds_np = [preds_np.item()]
+                    labels_np = [labels_np.item()]
+                elif len(preds_np.shape) == 1:
+                    preds_np = preds_np.tolist()
+                    labels_np = labels_np.tolist()
+                
+                all_predictions.extend(preds_np)
+                all_targets.extend(labels_np)
+                slide_names.extend(batch['slide_names'])
+        
+        all_predictions = np.array(all_predictions)
+        all_targets = np.array(all_targets)
+        
+        mse = mean_squared_error(all_targets, all_predictions)
+        mae = mean_absolute_error(all_targets, all_predictions)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(all_targets, all_predictions)
+        
+        pearson_corr, pearson_p = pearsonr(all_predictions, all_targets)
+        spearman_corr, spearman_p = spearmanr(all_predictions, all_targets)
+        
+        # round regressions to nearest integer for classification-style metrics
+        rounded_preds = np.round(all_predictions).astype(int)
+        rounded_targets = np.round(all_targets).astype(int)
+        
+        rounded_preds = np.clip(rounded_preds, 0, 3)
+        rounded_targets = np.clip(rounded_targets, 0, 3)
+        
+        exact_accuracy = np.mean(rounded_preds == rounded_targets)
+        adjacent_accuracy = np.mean(np.abs(rounded_preds - rounded_targets) <= 1)
+        
+        metrics = {
+            'mse': mse,
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'pearson_correlation': pearson_corr,
+            'pearson_p_value': pearson_p,
+            'spearman_correlation': spearman_corr,
+            'spearman_p_value': spearman_p,
+            'exact_accuracy': exact_accuracy,
+            'adjacent_accuracy': adjacent_accuracy
+        }
+        
+        results_df = pd.DataFrame({
+            'slide_name': slide_names,
+            'prediction': all_predictions,
+            'target': all_targets,
+            'error': all_predictions - all_targets,
+            'abs_error': np.abs(all_predictions - all_targets)
+        })
+        
+        if output_dir:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            results_df.to_csv(output_path / 'holdout_test_results_regressor.csv', index=False)
+            
+            with open(output_path / 'holdout_test_metrics_regressor.json', 'w') as f:
+                json.dump(metrics, f, indent=2)
+            
+            print(f"Results saved to: {output_path}")
+        
+        print(f"\n{'='*50}")
+        print("HELD-OUT TEST SET RESULTS (REGRESSOR)")
+        print(f"{'='*50}")
+        
+        for metric, value in metrics.items():
+            print(f"{metric}: {value:.4f}")
+        
+        print(f"\nRegression Analysis:")
+        print(f"  Target range: [{all_targets.min():.1f}, {all_targets.max():.1f}]")
+        print(f"  Prediction range: [{all_predictions.min():.2f}, {all_predictions.max():.2f}]")
+        
+        return {
+            'metrics': metrics,
+            'predictions': results_df,
+            'num_samples': len(all_predictions)
+        }
+        
+    finally:
+        if temp_split_file.exists():
+            temp_split_file.unlink()
+
+
+def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, output_dir: str = None) -> Dict[str, Any]:
+    
+    print("="*70)
+    print("EVALUATING REGRESSOR CV ENSEMBLE ON HELD-OUT TEST SET")
+    print("="*70)
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    cv_path = Path(cv_dir)
+    fold_models = []
+    
+    for fold_dir in cv_path.glob("cv_fold_*"):
+        best_model = fold_dir / "best_model.pth"
+        if best_model.exists():
+            fold_models.append(str(best_model))
+    
+    if not fold_models:
+        raise FileNotFoundError(f"No CV fold models found in {cv_dir}")
+    
+    print(f"Found {len(fold_models)} CV fold models")
+    
+    features_dir = config['data']['features_dir']
+    holdout_file = Path(features_dir) / 'splits' / 'holdout_split_regressor.json'
+    
+    with open(holdout_file, 'r') as f:
+        holdout_split = json.load(f)
+    
+    test_slides = holdout_split['test']
+    print(f"Evaluating on {len(test_slides)} held-out test slides")
+
+    test_split = {
+        'train': [],
+        'val': [],
+        'test': test_slides
+    }
+    
+    temp_split_file = Path(features_dir) / 'splits' / 'temp_holdout_test_regressor.json'
+    with open(temp_split_file, 'w') as f:
+        json.dump(test_split, f, indent=2)
+    
+    try:
+        test_loader = create_test_only_loader(
+            features_dir, config['data']['labels_file'], str(temp_split_file), config
+        )
+        
+        device = torch.device(config['hardware']['device'])
+        models = []
+        
+        for model_path in fold_models:
+            model = create_clam_regressor(config).to(device)
+            checkpoint = torch.load(model_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.eval()
+            models.append(model)
+        
+        print(f"Loaded {len(models)} models for ensemble")
+        
+        all_ensemble_predictions = []
+        all_targets = []
+        slide_names = []
+        
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Ensemble Evaluation"):
+                features = batch['features'].to(device)
+                labels = batch['labels'].to(device)
+                
+                batch_preds = []
+                for model in models:
+                    results = model(features)
+                    preds = results['logits'].squeeze()
+                    batch_preds.append(preds.cpu().numpy())
+                
+                # average predictions
+                ensemble_preds = np.mean(batch_preds, axis=0)
+                
+                labels_np = labels.cpu().numpy()
+                
+                if len(ensemble_preds.shape) == 0:
+                    ensemble_preds = [ensemble_preds.item()]
+                    labels_np = [labels_np.item()]
+                elif len(ensemble_preds.shape) == 1:
+                    ensemble_preds = ensemble_preds.tolist()
+                    labels_np = labels_np.tolist()
+                
+                all_ensemble_predictions.extend(ensemble_preds)
+                all_targets.extend(labels_np)
+                slide_names.extend(batch['slide_names'])
+        
+        all_ensemble_predictions = np.array(all_ensemble_predictions)
+        all_targets = np.array(all_targets)
+
+        mse = mean_squared_error(all_targets, all_ensemble_predictions)
+        mae = mean_absolute_error(all_targets, all_ensemble_predictions)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(all_targets, all_ensemble_predictions)
+        
+        pearson_corr, pearson_p = pearsonr(all_ensemble_predictions, all_targets)
+        spearman_corr, spearman_p = spearmanr(all_ensemble_predictions, all_targets)
+        
+        rounded_preds = np.round(all_ensemble_predictions).astype(int)
+        rounded_targets = np.round(all_targets).astype(int)
+        
+        rounded_preds = np.clip(rounded_preds, 0, 3)
+        rounded_targets = np.clip(rounded_targets, 0, 3)
+        
+        exact_accuracy = np.mean(rounded_preds == rounded_targets)
+        adjacent_accuracy = np.mean(np.abs(rounded_preds - rounded_targets) <= 1)
+        
+        ensemble_metrics = {
+            'mse': mse,
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'pearson_correlation': pearson_corr,
+            'pearson_p_value': pearson_p,
+            'spearman_correlation': spearman_corr,
+            'spearman_p_value': spearman_p,
+            'exact_accuracy': exact_accuracy,
+            'adjacent_accuracy': adjacent_accuracy
+        }
+        
+        ensemble_results_df = pd.DataFrame({
+            'slide_name': slide_names,
+            'ensemble_prediction': all_ensemble_predictions,
+            'target': all_targets,
+            'error': all_ensemble_predictions - all_targets,
+            'abs_error': np.abs(all_ensemble_predictions - all_targets)
+        })
+        
+        if output_dir:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            ensemble_results_df.to_csv(output_path / 'holdout_ensemble_results_regressor.csv', index=False)
+            
+            with open(output_path / 'holdout_ensemble_metrics_regressor.json', 'w') as f:
+                json.dump(ensemble_metrics, f, indent=2)
+        
+        print(f"\n{'='*60}")
+        print("ENSEMBLE HELD-OUT TEST SET RESULTS (REGRESSOR)")
+        print(f"{'='*60}")
+        
+        for metric, value in ensemble_metrics.items():
+            print(f"{metric}: {value:.4f}")
+        
+        print(f"\nRegression Analysis:")
+        print(f"  Target range: [{all_targets.min():.1f}, {all_targets.max():.1f}]")
+        print(f"  Prediction range: [{all_ensemble_predictions.min():.2f}, {all_ensemble_predictions.max():.2f}]")
+        
+        return {
+            'ensemble_metrics': ensemble_metrics,
+            'ensemble_predictions': ensemble_results_df,
+            'num_models': len(models),
+            'num_samples': len(all_ensemble_predictions)
+        }
+        
+    finally:
+        if temp_split_file.exists():
+            temp_split_file.unlink()
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate CLAM regressor models")
     parser.add_argument("--fold", type=str, help="Specific fold to evaluate (e.g., cv_fold_0)")
     parser.add_argument("--all-folds", action="store_true", help="Evaluate all available folds")
-    parser.add_argument("--checkpoints-dir", type=str, default="checkpoints_regressork32", help="Directory containing model checkpoints (default: checkpoints_regressork32)")
+    parser.add_argument("--checkpoints-dir", type=str, default="checkpoints_regressor", help="Directory containing model checkpoints (default: checkpoints_regressor)")
+    parser.add_argument("--config", type=str, default="configs/clam_regressor_training.yaml", help="Path to config file")
+    parser.add_argument("--holdout", action="store_true", help="Evaluate single model on held-out test set")
+    parser.add_argument("--cv-ensemble", action="store_true", help="Evaluate CV ensemble on held-out test set")
+    parser.add_argument("--model-path", type=str, help="Path to specific model for holdout evaluation")
+    parser.add_argument("--output-dir", type=str, help="Directory to save evaluation results")
     args = parser.parse_args()
     
     print("CLAM Regressor Model Evaluation")
     print("=" * 50)
     
-    config_path = "configs/clam_regressor_training.yaml"
+    if args.holdout:
+        if not args.model_path:
+            raise ValueError("--model-path required for held-out evaluation")
+        evaluate_regressor_on_holdout_test(args.model_path, args.config, args.output_dir)
+        return
     
+    elif args.cv_ensemble:
+        if not args.checkpoints_dir:
+            raise ValueError("--checkpoints-dir required for CV ensemble evaluation")
+        evaluate_regressor_cv_ensemble_on_holdout(args.checkpoints_dir, args.config, args.output_dir)
+        return
+    
+    config_path = args.config
     checkpoints_dir = Path(args.checkpoints_dir)
     
     if not checkpoints_dir.exists():
@@ -359,6 +720,9 @@ def main():
             print(f"   python evaluate_regressor.py --all-folds  # Evaluate all folds")
             for fold in fold_models:
                 print(f"   python evaluate_regressor.py --fold {fold['fold_name']}")
+            print(f"\nTo evaluate on held-out test set:")
+            print(f"   python evaluate_regressor.py --holdout --model-path {fold_models[0]['model_path']}")
+            print(f"   python evaluate_regressor.py --cv-ensemble --checkpoints-dir {args.checkpoints_dir}")
         
     elif (checkpoints_dir / "ensemble_summary.json").exists():
         print("Found ensemble training results")
@@ -400,11 +764,7 @@ def main():
     
     else:
         print(f"No trained models found in {checkpoints_dir}")
-        print("Expected one of:")
-        print("  - Cross-validation folds: cv_fold_*/best_model.pth")
-        print("  - Ensemble summary: ensemble_summary.json") 
-        print("  - Single model: best_model.pth")
-        return
+        print("Please train models first using train_regressor.py")
 
 
 if __name__ == "__main__":

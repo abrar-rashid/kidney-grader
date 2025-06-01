@@ -1,0 +1,88 @@
+model:
+  name: "CLAM"
+  task: "classification"
+  
+  clam:
+    gate: true # attention gating for feature selection
+    size_arg: "small"
+    dropout: 0.5 # aggressive, to prevent overfitting on this small dataset
+    k_sample: 32
+    instance_loss_fn: "svm"
+    
+  feature_dim: 1024  # UNI feature dimension
+  hidden_dim: 128
+  num_classes: 3  # for ordinal classification: num_thresholds = num_classes - 1
+
+training:
+  lr: 0.00005
+  weight_decay: 0.01 # strong L2 regularization
+  optimizer: "adam"
+  scheduler: "cosine"
+  
+  epochs: 300 
+  early_stopping_patience: 30
+  
+  loss_fn: "ordinal"  # custom ordinal loss
+  
+  bag_loss_weight: 0.8 
+  instance_loss_weight: 0.2
+
+data:
+  features_dir: "./data/features"
+  labels_file: "../banff_scores.csv"
+  target_column: "T"
+  
+  #cross validation strategy
+  split:
+    method: "stratified"
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+    random_seed: 42
+    
+  batch_size: 1
+  num_workers: 4
+  patch_augmentation: true
+
+validation:
+  metrics: ["accuracy", "macro_f1", "weighted_f1", "quadratic_kappa", "mae", "adjacent_accuracy", "confusion_matrix"]
+  save_predictions: true
+  monitor: "val_macro_f1"  # primary metric for classification
+  mode: "max"
+
+checkpoint:
+  save_dir: "./checkpoints_classifier"
+  save_best_only: false
+  save_every_n_epochs: 10
+  monitor: "val_macro_f1"
+  mode: "max"
+
+logging:
+  use_wandb: true
+  project_name: "kidney_tubulitis_classifier"
+  log_interval: 5
+
+hardware:
+  device: "cuda:2"
+  mixed_precision: false
+  compile_model: false
+
+random_seed: 42
+
+advanced:
+  gradient_clip_value: 1.0
+  label_smoothing: 0.0  # not applicable for ordinal loss
+  ensemble_models: 5  # train 5 models with different seeds
+  use_cross_validation: true
+  cv_folds: 5
+  patch_augmentation:
+    noise_std: 0.02
+    dropout_rate: 0.1
+    rotation_prob: 0.3
+
+# classification-specific settings
+classification:
+  num_classes: 4  # T0, T1, T2, T3
+  class_names: ["T0", "T1", "T2", "T3"]
+  ordinal: true
+  binary_threshold: 1.5  # for binary T0,T1 vs T2,T3 evaluation 

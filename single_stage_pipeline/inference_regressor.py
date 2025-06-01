@@ -22,7 +22,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from models import create_clam_regressor
 from training.dataset import WSIFeaturesDataset
-from training.tubule_filtered_dataset import TubuleFilteredDataset
 from preprocessing import UNIFeatureExtractor, KidneyPatchExtractor
 
 

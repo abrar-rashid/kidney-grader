@@ -9,37 +9,24 @@ def calculate_tubulitis_score(counts_df, output_dir):
 
     # filter to include only tubules with mononuclear cells
     inflamed = counts_df[counts_df.cell_count > 0]
-    num_foci = 0
-    
+
     # if no inflamed tubules are present, is t0
-    if inflamed.empty:
+    if inflamed.empty or len(inflamed) < 2:
         score = "t0"
     else:
-        # group by foci and find max cell count per focus
-        foci_max = inflamed.groupby("focus_id")["cell_count"].max()
-        num_foci = len(foci_max)
+        # determine score based on the most inflamed tubule
+        max_cell_count = inflamed["cell_count"].max()
 
-        # check if there iss only one focus and no other inflamed tubules
-        if num_foci == 1:
-            # ensure no other inflamed tubules outside this focus
-            total_inflamed_tubules = len(inflamed)
-            if total_inflamed_tubules == inflamed['focus_id'].value_counts().iloc[0]:
-                score = "t0"
-            else:
-                score = "t1"
-        elif num_foci < 2:
-            score = "t0"
-        elif (foci_max > 10).any():
+        if max_cell_count > 10:
             score = "t3"
-        elif (foci_max >= 5).any():
+        elif max_cell_count >= 5:
             score = "t2"
         else:
             score = "t1"
 
     grading_report = {
         "Total inflammatory tubules": len(inflamed),
-        "Total foci": num_foci,
-        "Max cells in any tubule": int(foci_max.max()) if not inflamed.empty else 0,
+        "Max cells in any tubule": int(inflamed["cell_count"].max()) if not inflamed.empty else 0,
         "Tubulitis Grade": score
     }
 

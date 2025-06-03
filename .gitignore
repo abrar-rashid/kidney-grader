@@ -16,9 +16,9 @@ venv/
 data/
 *.DS_Store
 
-checkpoints/
 *.pth
 *.pt
+checkpoints/
 
 output*
 results*

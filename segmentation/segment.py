@@ -71,23 +71,41 @@ def process_wsi(wsi_path, model, device, output_dir):
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     memmap_path = Path(output_dir) / "full_mask_memmap.dat"
-    full_mask = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(max_y, max_x))
-    full_mask[:] = 0
 
-    for j, (patch_np, x, y) in tqdm(enumerate(patches), total=len(patches), desc="Running inference on patches"):
-        img_tensor = transform(Image.fromarray(patch_np)).unsqueeze(0).to(device)
+    try:
+        full_mask = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(max_y, max_x))
+        full_mask[:] = 0
 
-        with torch.no_grad():
-            outputs = model(img_tensor)
-            outputs = outputs[0] if isinstance(outputs, tuple) else outputs
-            pred_class = torch.argmax(outputs.squeeze(), dim=0).cpu().numpy()
-            full_mask[y:y+PATCH_SIZE, x:x+PATCH_SIZE] = pred_class
+        for j, (patch_np, x, y) in tqdm(enumerate(patches), total=len(patches), desc="Running inference on patches"):
+            img_tensor = transform(Image.fromarray(patch_np)).unsqueeze(0).to(device)
 
-        if j % 500 == 0:
-            torch.cuda.empty_cache()
+            with torch.no_grad():
+                outputs = model(img_tensor)
+                outputs = outputs[0] if isinstance(outputs, tuple) else outputs
+                pred_class = torch.argmax(outputs.squeeze(), dim=0).cpu().numpy()
+                full_mask[y:y+PATCH_SIZE, x:x+PATCH_SIZE] = pred_class
 
-    torch.cuda.empty_cache()
-    return full_mask
+            if j % 500 == 0:
+                torch.cuda.empty_cache()
+
+        torch.cuda.empty_cache()
+        
+        # convert memmap to regular array to avoid file handle issues
+        full_mask_array = np.array(full_mask)
+        
+        # explicitly delete memmap reference and clean up
+        del full_mask
+        
+        return full_mask_array
+        
+    finally:
+        # always cleanup memmap file, even if processing fails
+        if memmap_path.exists():
+            try:
+                memmap_path.unlink()
+                print(f"Cleaned up memmap file: {memmap_path}")
+            except Exception as e:
+                print(f"Warning: Could not delete memmap file: {e}")
 
 
 def process_regular_image_tensor(img_tensor, model, device):
@@ -183,14 +201,17 @@ def overlay_rgb(base: Image.Image, mask_rgb: Image.Image, alpha: float = 0.4) ->
 def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=False):
     # Save segmentation results and visualizations.
 
-    def downsample_array(arr, factor):
-        arr = arr.astype(np.int32, copy=False)   # ← ADD THIS LINE
-        h, w = arr.shape
-        new_width  = int(w / factor)
-        new_height = int(h / factor)
-        return cv2.resize(arr,
-                        (new_width, new_height),
-                        interpolation=cv2.INTER_NEAREST)
+    def downsample_array(arr, factor, copy: bool = False):
+        if factor < 1:
+            raise ValueError("factor must be a positive integer")
+        h, w   = arr.shape[:2]
+        h_trim = (h // factor) * factor
+        w_trim = (w // factor) * factor
+
+        # Strided nearest-neighbour pick
+        ds_view = arr[:h_trim:factor, :w_trim:factor]
+
+        return ds_view.copy() if copy else ds_view
 
     def visualize_instance_mask(mask, output_path, cmap_name='nipy_spectral'):
         norm_mask = mask.astype(np.float32) / mask.max() if mask.max() > 0 else mask
@@ -204,7 +225,7 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
 
     # save instance masks for each class
     for class_idx in range(1, NUM_CLASSES):
-        if class_idx in [2, 3]:
+        if class_idx in [2, 3, 4]:
             continue # skip veins and arteries for now
 
         instance_mask, num_instances = get_instance_mask(full_mask, tissue_type=class_idx)
@@ -249,9 +270,13 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
 
                     # down‑sample both mask and image same as semantic mask
                     downsample_factor = 8
-                    small_inst_mask = downsample_array(instance_mask, downsample_factor)
-                    small_original = original.resize((small_inst_mask.shape[1], small_inst_mask.shape[0]))
+                    small_inst_mask = downsample_array(instance_mask, downsample_factor, copy=True)
 
+                    instance_mask.flush()
+                    del instance_mask
+                    gc.collect()
+
+                    small_original = original.resize((small_inst_mask.shape[1], small_inst_mask.shape[0]))
                     coloured_mask = colourise_instances(small_inst_mask)
                     overlay_img = overlay_rgb(small_original, coloured_mask, alpha=0.4)
 
@@ -261,18 +286,6 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
                     print(f"Instance overlay saved: {overlay_path}")
                 except Exception as e:
                     print(f"Warning: Instance overlay for class {class_idx} failed: {e}")
-
-        del instance_mask
-        gc.collect()
-
-    # clean up memmap if it exists
-    memmap_path = output_dir / "full_mask_memmap.dat"
-    if memmap_path.exists():
-        try:
-            memmap_path.unlink()
-            print(f"Deleted memmap file: {memmap_path}")
-        except Exception as e:
-            print(f"Warning: Could not delete memmap file: {e}")
 
     if visualise:
         print("Creating visualization of semantic mask")

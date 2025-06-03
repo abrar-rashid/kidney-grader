@@ -63,7 +63,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run detection and correlate with T/ TI-score")
     parser.add_argument("--input_dir", required=True, help="Directory with t0/, ti0/, etc.")
     parser.add_argument("--output_dir", required=True, help="Output folder for results")
-    parser.add_argument("--model_path", default="detection/models/")
+    parser.add_argument("--model_path", default="checkpoints/detection/")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 

@@ -1,4 +1,3 @@
-
 # usage: python run_batch_pipeline.py --input_dir /path/to/wsi/files --output_dir batch_results
 # only grading with custom params: python run_batch_pipeline.py --input_dir /path/to/wsi/files --stage grade --prob_thres 0.75
 
@@ -57,8 +56,21 @@ def run_single_wsi(wsi_path: Path, output_dir: Path, **kwargs) -> dict:
         cmd.extend(["--prob_thres", str(kwargs["prob_thres"])])
     if kwargs.get("model_path"):
         cmd.extend(["--model_path", kwargs["model_path"]])
-    if kwargs.get("detection_json"):
-        cmd.extend(["--detection_json", kwargs["detection_json"]])
+    
+    # handle precomputed detections directory
+    detection_json = kwargs.get("detection_json")
+    if kwargs.get("precomputed_detections_dir") and not detection_json:
+        # Auto-locate detection file for this WSI
+        precomputed_dir = Path(kwargs["precomputed_detections_dir"])
+        wsi_detection_dir = precomputed_dir / wsi_name
+        detection_file = wsi_detection_dir / "detected-inflammatory-cells.json"
+        if detection_file.exists():
+            detection_json = str(detection_file)
+        else:
+            logging.warning(f"No precomputed detection found for {wsi_name} at {detection_file}")
+    
+    if detection_json:
+        cmd.extend(["--detection_json", detection_json])
     if kwargs.get("instance_mask_class1"):
         cmd.extend(["--instance_mask_class1", kwargs["instance_mask_class1"]])
     
@@ -67,7 +79,7 @@ def run_single_wsi(wsi_path: Path, output_dir: Path, **kwargs) -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=kwargs.get("timeout", 3600)
+            timeout=kwargs.get("timeout", 10800)
         )
         
         duration = time.time() - start_time
@@ -95,7 +107,7 @@ def run_single_wsi(wsi_path: Path, output_dir: Path, **kwargs) -> dict:
             "wsi_name": wsi_name,
             "status": "timeout",
             "duration": time.time() - start_time,
-            "error": f"Timeout after {kwargs.get('timeout', 3600)} seconds"
+            "error": f"Timeout after {kwargs.get('timeout', 10800)} seconds"
         }
     except Exception as e:
         return {
@@ -212,11 +224,12 @@ def main():
     
     parser.add_argument("--detection_json", help="Path to custom detection JSON file")
     parser.add_argument("--instance_mask_class1", help="Path to custom tubule instance mask")
+    parser.add_argument("--precomputed_detections_dir", help="Directory containing precomputed detection folders organized by WSI name")
     
     parser.add_argument("--max_workers", type=int, default=1,
                        help="Number of parallel workers (default: 1 for sequential)")
-    parser.add_argument("--timeout", type=int, default=3600,
-                       help="Timeout per WSI in seconds (default: 3600)")
+    parser.add_argument("--timeout", type=int, default=10800,
+                       help="Timeout per WSI in seconds (default: 10800 seconds = 3 hours)")
     
     parser.add_argument("--pattern", help="Only process files matching this pattern (e.g., '*case1*')")
     parser.add_argument("--limit", type=int, help="Limit number of files to process (for testing)")
@@ -261,6 +274,7 @@ def main():
         "model_path": args.model_path,
         "detection_json": args.detection_json,
         "instance_mask_class1": args.instance_mask_class1,
+        "precomputed_detections_dir": args.precomputed_detections_dir,
         "timeout": args.timeout
     }
     

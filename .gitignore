@@ -17,9 +17,9 @@ data/
 *.h5
 *.DS_Store
 
-checkpoints/
 *.pth
 *.pt
+checkpoints/
 
 output*
 results*

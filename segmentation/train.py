@@ -116,7 +116,7 @@ def train_model(h5_path='data/train_data.h5',
 
 if __name__ == "__main__":
     train_model(
-        checkpoint_path='checkpoints/best_current_model.pth',
+        checkpoint_path='checkpoints/segmentation/kidney_grader_unet.pth',
         epochs=200,
         save_dir='checkpoints'
     )

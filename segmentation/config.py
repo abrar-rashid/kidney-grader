@@ -1,4 +1,4 @@
-DEFAULT_SEGMENTATION_MODEL_PATH = "checkpoints/best_current_model.pth"
+DEFAULT_SEGMENTATION_MODEL_PATH = "checkpoints/segmentation/kidney_grader_unet.pth"
 DEFAULT_YOLO_MODEL_PATH = "checkpoints/yolov8_mononuclear.pt"
 
 PATCH_SIZE = 512

@@ -114,7 +114,7 @@ def compute_map(pred_mask, gt_mask, thresholds=np.arange(0.5, 1.0, 0.05)):
         aps.append(ap)
     return np.mean(aps)
 
-def run_evaluation(checkpoint_path="checkpoints/best_current_model.pth", 
+def run_evaluation(checkpoint_path="checkpoints/segmentation/kidney_grader_unet.pth", 
                    h5_path="data/test_data.h5",
                    output_dir="evaluation_results"):
     os.makedirs(output_dir, exist_ok=True)

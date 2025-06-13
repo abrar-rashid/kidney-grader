@@ -10,8 +10,7 @@ import cv2
 from rich.console import Console
 from rich.progress import Progress
 from grading.banff_grade import calculate_tubulitis_score
-from quantification.quantify import analyze_tubule_cell_distribution, convert_numpy_types, count_cells_in_tubules
-from quantification.tubule_utils import identify_foci
+from grading.quantify import analyze_tubule_cell_distribution, convert_numpy_types, count_cells_in_tubules
 
 console = Console()
 
@@ -31,14 +30,12 @@ def setup_logging(output_dir: Path) -> None:
 class KidneyGraderPipeline:
     # Main pipeline for kidney biopsy grading
     
-    def __init__(self, output_dir: str, model_path: str = "checkpoints/best_current_model.pth", prob_thres: float = 0.80, foci_dist = 200, custom_detection_json: str = None, custom_instance_mask_class1: str = None, custom_instance_mask_class4: str = None):
+    def __init__(self, output_dir: str, model_path: str = "checkpoints/segmentation/kidney_grader_unet.pth", prob_thres: float = 0.50, custom_detection_json: str = None, custom_instance_mask_class1: str = None):
         self.output_dir = Path(output_dir)
         self.model_path = model_path
         self.prob_thres = prob_thres
-        self.foci_dist = foci_dist
         self.custom_detection_json = custom_detection_json
         self.custom_instance_mask_class1 = custom_instance_mask_class1
-        self.custom_instance_mask_class4 = custom_instance_mask_class4
 
         setup_logging(self.output_dir)
         self.logger = logging.getLogger(__name__)
@@ -57,8 +54,7 @@ class KidneyGraderPipeline:
         
         # Create parameter-specific tag for directories
         prob_tag = f"p{self.prob_thres:.2f}".replace(".", "")
-        dist_tag = f"d{self.foci_dist}"
-        param_tag = f"{prob_tag}_{dist_tag}"
+        param_tag = f"{prob_tag}"
         
         # Create WSI-specific directory
         wsi_dir = self.individual_reports_dir / wsi_name
@@ -70,34 +66,18 @@ class KidneyGraderPipeline:
         segmentation_dir.mkdir(exist_ok=True)
         detection_dir.mkdir(exist_ok=True)
         
-        # Create parameter-specific directory for grading
-        param_dir = wsi_dir / param_tag
-        param_dir.mkdir(exist_ok=True)
-        
-        # Define quantification directory path but DON'T create it yet
-        # Let the quantification stage create it only when needed
-        quantification_dir = param_dir / "quantification"
-        
-        # Create parameters file
-        params = {
-            "prob_thres": self.prob_thres,
-            "foci_dist": self.foci_dist,
-            "model_path": str(self.model_path),
-            "param_tag": param_tag
-        }
-        params_file = param_dir / "parameters.json"
-        with open(params_file, "w") as f:
-            json.dump(params, f, indent=2)
+        # Create parameter-specific grading directory
+        grading_dir = wsi_dir / "grading" / param_tag
+        grading_dir.mkdir(parents=True, exist_ok=True)
         
         return {
             "wsi_name": wsi_name,
             "param_tag": param_tag,
             "tubule_mask": segmentation_dir / f"{wsi_name}_full_instance_mask_class1.tiff",
             "inflam_cell_mask": detection_dir / "detected-inflammatory-cells.json",
-            "counts_csv": quantification_dir / f"{wsi_name}_tubule_counts.csv",
-            "quant_json": quantification_dir / f"{wsi_name}_quantification.json",
-            "grading_report": param_dir / "grading_report.json",
-            "parameters": str(params_file)
+            "counts_csv": grading_dir / "tubule_counts.csv",
+            "quant_json": grading_dir / "quantification.json",
+            "grading_report": grading_dir / "grading_report.json"
         }
     
     def run_stage1(self, wsi_path: str, force: bool = False, visualise: bool = False) -> Dict[str, Any]:
@@ -111,33 +91,28 @@ class KidneyGraderPipeline:
         output_dir = self.individual_reports_dir / wsi_name / "segmentation"
         semantic_mask_path = output_dir / f"{wsi_name}_semantic_mask.tiff"
         instance_mask_path1 = output_dir / f"{wsi_name}_full_instance_mask_class1.tiff"
-        instance_mask_path4 = output_dir / f"{wsi_name}_full_instance_mask_class4.tiff"
 
         # Check if custom instance masks are provided
         custom_masks_used = False
-        if self.custom_instance_mask_class1 and self.custom_instance_mask_class4:
+        if self.custom_instance_mask_class1:
             output_dir.mkdir(exist_ok=True)
             
             # Handle custom class 1 instance mask (tubules)
             custom_mask_path1 = Path(self.custom_instance_mask_class1)
-            custom_mask_path4 = Path(self.custom_instance_mask_class4)
             
             # Check if both files exist
-            if custom_mask_path1.exists() and custom_mask_path4.exists():
-                self.logger.info(f"Using custom instance masks:")
+            if custom_mask_path1.exists():
+                self.logger.info(f"Using custom instance mask:")
                 self.logger.info(f"  - Class 1 (tubules): {custom_mask_path1}")
-                self.logger.info(f"  - Class 4 (glomeruli): {custom_mask_path4}")
                 
                 # Copy both files
                 import shutil
                 shutil.copy(custom_mask_path1, instance_mask_path1)
-                shutil.copy(custom_mask_path4, instance_mask_path4)
                 custom_masks_used = True
                 
                 # Return early with custom masks
                 instance_mask_paths = {
-                    1: str(instance_mask_path1),
-                    4: str(instance_mask_path4)
+                    1: str(instance_mask_path1)
                 }
                 return {
                     "semantic_mask_path": str(semantic_mask_path) if semantic_mask_path.exists() else None,
@@ -148,13 +123,11 @@ class KidneyGraderPipeline:
                 missing_files = []
                 if not custom_mask_path1.exists():
                     missing_files.append(f"Class 1 mask: {custom_mask_path1}")
-                if not custom_mask_path4.exists():
-                    missing_files.append(f"Class 4 mask: {custom_mask_path4}")
                     
-                self.logger.warning(f"Custom instance masks not found: {', '.join(missing_files)}. Will run segmentation.")
+                self.logger.warning(f"Custom instance mask not found: {', '.join(missing_files)}. Will run segmentation.")
 
         # check if both instance masks exist before skipping
-        if instance_mask_path1.exists() and instance_mask_path4.exists() and not force:
+        if instance_mask_path1.exists() and not force:
             self.logger.info(f"Segmentation mask already exists at {output_dir}, skipping segmentation.")
             instance_mask_paths = {
                 int(p.stem.split("class")[-1]): str(p)
@@ -260,7 +233,7 @@ class KidneyGraderPipeline:
         run_inflammatory_cell_detection(
             wsi_path=wsi_path,
             output_dir=output_dir,
-            model_path="detection/models/",
+            model_path="checkpoints/detection/",
             visualise=visualise
         )
 
@@ -298,32 +271,31 @@ class KidneyGraderPipeline:
 
     def run_stage3(self, wsi_path: str, force: bool = False, visualise: bool = False) -> dict:
         import tifffile as tiff
-        self.logger.info("Running Stage 3: Quantification of inflammatory cells per tubule")
+        import pandas as pd
+        
+        self.logger.info("Running Stage 3: Quantification and Grading")
+        self.logger.info("====== STAGE 3: GRADING STAGE STARTED ======")
 
         paths = self.get_output_paths(wsi_path)
         wsi_name = Path(wsi_path).stem
         
-        # Check if quantification already exists
-        if paths["counts_csv"].exists() and paths["quant_json"].exists() and not force:
-            # Load the existing results to check parameters
+        # Check if grading already exists
+        if paths["grading_report"].exists() and not force:
             try:
-                with open(paths["quant_json"]) as f:
+                with open(paths["grading_report"]) as f:
                     existing_results = json.load(f)
                 
                 # Check if parameters match
                 existing_prob_thres = existing_results.get("prob_thres")
-                existing_foci_dist = existing_results.get("foci_dist")
                 
-                if (existing_prob_thres == self.prob_thres and 
-                    existing_foci_dist == self.foci_dist):
-                    # Parameters match, we can reuse the existing results
-                    self.logger.info(f"Quantification already exists for parameters prob_thres={self.prob_thres}, foci_dist={self.foci_dist}. Reusing results.")
+                if (existing_prob_thres == self.prob_thres):
+                    self.logger.info(f"Grading already exists for parameters prob_thres={self.prob_thres}. Reusing results.")
                     
                     # If visualization is requested, generate it even with existing results
                     if visualise:
-                        self.logger.info("Generating visualization for existing quantification results")
+                        self.logger.info("Generating visualization for existing grading results")
                         try:
-                            from quantification.visualize_quantification import create_quantification_overlay
+                            from grading.visualise_quantification import create_quantification_overlay
                             
                             # Load necessary data for visualization
                             tubule_mask_path = self.individual_reports_dir / wsi_name / "segmentation" / f"{wsi_name}_full_instance_mask_class1.tiff"
@@ -335,23 +307,17 @@ class KidneyGraderPipeline:
                             with open(detection_json_path) as f:
                                 inflam = json.load(f)
                             
-                            # Load all points first
-                            all_points = inflam["points"]
-                            
                             # Filter points based on probability threshold
                             filtered_points = [
-                                pt for pt in all_points 
+                                pt for pt in inflam["points"] 
                                 if "probability" in pt and pt["probability"] >= self.prob_thres
                             ]
                             
-                            # Extract coordinates from filtered points
+                            # Extract coordinates (in mm)
                             mm_coords = np.array(
                                 [[pt["point"][0], pt["point"][1]] for pt in filtered_points],
                                 dtype=np.float32,
                             )
-                            
-                            # Load counts from existing CSV
-                            counts_df = pd.read_csv(paths["counts_csv"])
                             
                             # Create visualization directory
                             vis_dir = Path(paths["counts_csv"]).parent / "visualization"
@@ -361,7 +327,6 @@ class KidneyGraderPipeline:
                                 wsi_path=wsi_path,
                                 tubule_mask=tubule_mask,
                                 cell_coords=mm_coords,
-                                counts_df=counts_df,
                                 output_dir=vis_dir
                             )
                             
@@ -374,13 +339,24 @@ class KidneyGraderPipeline:
                             import traceback
                             self.logger.error(traceback.format_exc())
                     
+                    # Ensure grading_report path is included in return
+                    existing_results["grading_report"] = str(paths["grading_report"])
+                    
+                    # Load quantification data to get missing fields like total_tubules, total_inflam_cells, etc.
+                    try:
+                        if paths["quant_json"].exists():
+                            with open(paths["quant_json"]) as f:
+                                quant_data = json.load(f)
+                            # Merge quantification data with existing results
+                            existing_results.update(quant_data)
+                    except Exception as e:
+                        self.logger.warning(f"Could not load quantification data: {e}")
+                    
                     return existing_results
                 else:
-                    # Parameters don't match, need to recompute
-                    self.logger.info(f"Existing quantification found but parameters differ (existing: prob_thres={existing_prob_thres}, foci_dist={existing_foci_dist}, current: prob_thres={self.prob_thres}, foci_dist={self.foci_dist}). Recomputing.")
+                    self.logger.info(f"Existing grading found but parameters differ (existing: prob_thres={existing_prob_thres}, current: prob_thres={self.prob_thres}). Recomputing.")
             except Exception as e:
-                # If there's an error reading the file, recompute to be safe
-                self.logger.warning(f"Error reading existing quantification: {e}. Recomputing.")
+                self.logger.warning(f"Error reading existing grading: {e}. Recomputing.")
         
         # Load data from shared segmentation directory
         tubule_mask_path = self.individual_reports_dir / wsi_name / "segmentation" / f"{wsi_name}_full_instance_mask_class1.tiff"
@@ -394,7 +370,7 @@ class KidneyGraderPipeline:
 
         # Load the instance mask, which is memorymapped for large files
         with tiff.TiffFile(tubule_mask_path) as tif:
-            tubule_mask = tif.asarray(out='memmap')  # Lazy load to avoid memory overload
+            tubule_mask = tif.asarray(out='memmap')
 
         # Load inflammatory cell detections
         with open(detection_json_path) as f:
@@ -419,54 +395,68 @@ class KidneyGraderPipeline:
         self.logger.info(f"Filtered inflammatory cells from {total_points} to {len(filtered_points)} using threshold {self.prob_thres}")
 
         MICRONS_PER_PIXEL = 0.24199951445730394
-        cell_coords = (mm_coords * 1000 / MICRONS_PER_PIXEL).astype(np.int32)
+        # Fix coordinate system: mm_coords are (x,y) but count_cells_in_tubules expects (y,x)
+        # So we need to swap and convert: (x,y) -> (y,x) in pixels
+        cell_coords = np.column_stack([
+            (mm_coords[:, 1] * 1000 / MICRONS_PER_PIXEL).astype(np.int32),  # y coordinates
+            (mm_coords[:, 0] * 1000 / MICRONS_PER_PIXEL).astype(np.int32)   # x coordinates
+        ])
 
+        # Debug logging
+        self.logger.info(f"[DEBUG] Total inflammatory cells detected: {total_points}")
+        self.logger.info(f"[DEBUG] Cells after prob_thres={self.prob_thres} filtering: {len(filtered_points)}")
+        if len(filtered_points) > 0:
+            self.logger.info(f"[DEBUG] MM coordinate range: X=[{mm_coords[:, 0].min():.3f}, {mm_coords[:, 0].max():.3f}], Y=[{mm_coords[:, 1].min():.3f}, {mm_coords[:, 1].max():.3f}]")
+            self.logger.info(f"[DEBUG] Pixel coordinate range: X=[{cell_coords[:, 1].min()}, {cell_coords[:, 1].max()}], Y=[{cell_coords[:, 0].min()}, {cell_coords[:, 0].max()}]")
+        
+        self.logger.info(f"[DEBUG] Tubule mask shape: {tubule_mask.shape}")
+        unique_tubule_ids = np.unique(tubule_mask)
+        self.logger.info(f"[DEBUG] Unique tubule IDs: {len(unique_tubule_ids)} (range: {unique_tubule_ids.min()} to {unique_tubule_ids.max()})")
+        
         from tiffslide import TiffSlide
         slide = TiffSlide(wsi_path)
         self.logger.info(f"[Stage 3] WSI name: {paths['wsi_name']}")
         self.logger.info(f"[Stage 3] WSI size: {slide.dimensions}")
         self.logger.info(f"[Stage 3] Tubule mask shape: {tubule_mask.shape}")
-        self.logger.info(f"[Stage 3] Parameters: prob_thres={self.prob_thres}, foci_dist={self.foci_dist}")
+        self.logger.info(f"[Stage 3] Parameters: prob_thres={self.prob_thres}")
 
-        # Generate foci with parameter-specific distance
-        foci_mask = identify_foci(tubule_mask, min_distance=self.foci_dist)
-        counts_df = count_cells_in_tubules(cell_coords, tubule_mask, foci_mask)
-
-        # Create quantification directory only when we're actually saving results
-        quantification_dir = Path(paths["counts_csv"]).parent
-        quantification_dir.mkdir(exist_ok=True)
+        counts_df = count_cells_in_tubules(cell_coords, tubule_mask)
         
-        # Save results to parameter-specific directory and get summary stats in one step
-        # (avoiding duplicate call to analyze_tubule_cell_distribution)
+        # Debug the results
+        self.logger.info(f"[DEBUG] Count results: {len(counts_df)} tubules with cells")
+        if len(counts_df) > 0:
+            self.logger.info(f"[DEBUG] Top 5 tubules by cell count: {counts_df.head()[['tubule_id', 'cell_count']].to_dict('records')}")
+        else:
+            self.logger.warning("[DEBUG] No cells found in any tubules!")
+
+        # Create grading directory only when we're actually saving results
+        grading_dir = Path(paths["counts_csv"]).parent
+        grading_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save results directly without using save_counts_csv to avoid redundant files
         self.logger.info("Saving counts and computing summary statistics...")
         
-        # First, save the CSV and get summary stats (without redundant analysis)
+        # Save the CSV and get summary stats
         counts_df.to_csv(paths["counts_csv"], index=False)
         summary_stats = analyze_tubule_cell_distribution(counts_df)
         
-        # Save summary stats separately
-        summary_path = Path(paths["counts_csv"]).parent / "summary_stats.csv"
-        pd.DataFrame([summary_stats]).to_csv(summary_path, index=False)
-        
         self.logger.info(f"Saved cell counts to {paths['counts_csv']}")
-        self.logger.info(f"Saved summary statistics to {summary_path}")
-        
+
         # Create visualization if requested
         visualization_path = None
         if visualise:
             self.logger.info("Generating visualization for quantification results")
             try:
-                from quantification.visualize_quantification import create_quantification_overlay
+                from grading.visualise_quantification import create_quantification_overlay
                 
                 # Create visualization directory
-                vis_dir = quantification_dir / "visualization"
+                vis_dir = grading_dir / "visualization"
                 
                 # Generate overlay
                 visualization_path = create_quantification_overlay(
                     wsi_path=wsi_path,
                     tubule_mask=tubule_mask,
                     cell_coords=mm_coords,
-                    counts_df=counts_df,
                     output_dir=vis_dir
                 )
                 
@@ -478,31 +468,86 @@ class KidneyGraderPipeline:
                 self.logger.error(traceback.format_exc())
         
         # Create per_tubule_counts directly in the format needed for output
-        # (avoiding duplicate dictionary creation)
         per_tubule_counts = {int(k): int(v) for k, v in zip(counts_df['tubule_id'], counts_df['cell_count'])}
 
-        output = {
+        # Calculate Banff tubulitis score
+        grading_result = calculate_tubulitis_score(
+            counts_df=counts_df,
+            output_dir=grading_dir
+        )
+
+        # Check if we have ground truth T score
+        true_t_score = None
+        
+        # Try to get ground truth from banff_scores.csv if it exists
+        banff_csv = Path("banff_scores.csv")
+        if banff_csv.exists():
+            try:
+                banff_df = pd.read_csv(banff_csv)
+                
+                # Try to find this WSI in the ground truth data
+                wsi_filename = f"{wsi_name}.svs"
+                match = banff_df[banff_df["filename"] == wsi_filename]
+                
+                if not match.empty and "T" in match.columns and pd.notna(match["T"].values[0]):
+                    true_t_score = float(match["T"].values[0])
+                    self.logger.info(f"Found ground truth T score: {true_t_score} for {wsi_name}")
+            except Exception as e:
+                self.logger.warning(f"Could not load ground truth T score: {e}")
+
+        # Create quantification data (detailed cell counting results)
+        quantification_data = {
             "wsi_name": paths["wsi_name"],
             "total_inflam_cells": int(len(cell_coords)),
             "total_tubules": int(len(np.unique(tubule_mask)) - 1),
             "tubule_counts_csv": str(paths["counts_csv"]),
-            "per_tubule_inflam_cell_counts": per_tubule_counts,  # Already in the correct format
+            "per_tubule_inflam_cell_counts": per_tubule_counts,
+            "mean_cells_per_tubule": float(summary_stats.get('mean_cells_per_tubule', 0.0)),
             "summary_stats": convert_numpy_types(summary_stats),
             "prob_thres": self.prob_thres,
-            "foci_dist": self.foci_dist,
             "param_tag": paths["param_tag"]
         }
         
         # Add visualization path if available
         if visualization_path:
-            output["visualization_path"] = str(visualization_path)
+            quantification_data["visualization_path"] = str(visualization_path)
 
+        # Create grading report (focused on scoring and evaluation)
+        grading_report_data = {
+            "wsi_name": paths["wsi_name"],
+            "tubulitis_score_predicted": grading_result["score"],
+            "prob_thres": self.prob_thres,
+            "param_tag": paths["param_tag"],
+            "quantification_json": str(paths["quant_json"])
+        }
+        
+        # Add ground truth evaluation if available
+        if true_t_score is not None:
+            # Store ground truth in the same format as prediction (t0, t1, t2, t3)
+            grading_report_data["tubulitis_score_ground_truth"] = f"t{int(round(true_t_score))}"
+            
+            # Extract numeric value from prediction for comparison
+            pred_score = float(grading_result["score"][1:]) if grading_result["score"].startswith("t") else float(grading_result["score"])
+            
+            # Calculate difference and correctness
+            grading_report_data["score_difference"] = abs(pred_score - true_t_score)
+            grading_report_data["correct_category"] = (round(pred_score) == round(true_t_score))
+
+        # Save separate files
         with open(paths["quant_json"], "w") as f:
-            json.dump(output, f, indent=2)
+            json.dump(quantification_data, f, indent=2)
 
-        self.logger.info(f"Saved structured summary to {paths['quant_json']}")
-        self.logger.info("====== STAGE 3: QUANTIFICATION COMPLETED ======")  # Add explicit stage marker
-        return output
+        with open(paths["grading_report"], "w") as f:
+            json.dump(grading_report_data, f, indent=2)
+
+        self.logger.info(f"Saved quantification data to {paths['quant_json']}")
+        self.logger.info(f"Saved grading report to {paths['grading_report']}")
+        self.logger.info("====== STAGE 3: GRADING COMPLETED ======")
+        
+        # Return combined data for pipeline use
+        combined_result = {**quantification_data, **grading_report_data}
+        combined_result["grading_report"] = str(paths["grading_report"])
+        return combined_result
 
     def create_summary_files(self, update_summary: bool = True) -> None:
         """Create or update summary files with all results across parameter sets.
@@ -525,76 +570,36 @@ class KidneyGraderPipeline:
         )
         from scipy.stats import spearmanr, pearsonr
         
-        # Collect all grading results across parameter sets
+        # Collect all grading results
         results = []
-        
         for wsi_dir in self.individual_reports_dir.iterdir():
             if not wsi_dir.is_dir():
                 continue
-                
             wsi_name = wsi_dir.name
             
-            # Look through parameter-specific directories
-            for param_dir in wsi_dir.iterdir():
-                if not param_dir.is_dir() or not param_dir.name.startswith("p"):
-                    continue
-                    
-                grading_report_path = param_dir / "grading_report.json"
-                summary_stats_path = param_dir / "summary_stats.csv"
+            # Look for grading reports in the new parameter-specific structure
+            grading_dir = wsi_dir / "grading"
+            if not grading_dir.exists():
+                continue
                 
+            # Find all parameter-specific grading reports
+            for param_dir in grading_dir.iterdir():
+                if not param_dir.is_dir():
+                    continue
+                grading_report_path = param_dir / "grading_report.json"
                 if not grading_report_path.exists():
                     continue
                     
                 try:
                     with open(grading_report_path) as f:
                         data = json.load(f)
-                        
                     result = {
                         "wsi_name": wsi_name,
                         "tubulitis_score_predicted": data.get("tubulitis_score_predicted", data.get("tubulitis_score", None)),
                         "tubulitis_score_ground_truth": data.get("tubulitis_score_ground_truth", None),
                         "prob_thres": data.get("prob_thres", None),
-                        "foci_dist": data.get("foci_dist", None),
-                        "param_tag": data.get("param_tag", param_dir.name),
-                        "total_inflammatory_tubules": data.get("Total inflammatory tubules", 0),
-                        "total_foci": data.get("Total foci", 0),
-                        "max_cells_in_tubule": data.get("Max cells in any tubule", 0)
+                        "param_tag": data.get("param_tag", param_dir.name)
                     }
-                    
-                    # Add additional metrics from summary_stats if available
-                    if summary_stats_path.exists():
-                        try:
-                            summary_df = pd.read_csv(summary_stats_path)
-                            if not summary_df.empty:
-                                result.update({
-                                    "total_tubules": summary_df["total_tubules"].iloc[0],
-                                    "total_cells": summary_df["total_cells"].iloc[0],
-                                    "mean_cells_per_tubule": summary_df["mean_cells_per_tubule"].iloc[0],
-                                    "std_cells_per_tubule": summary_df["std_cells_per_tubule"].iloc[0]
-                                })
-                                
-                                # Try to extract focus stats if available
-                                if "focus_stats" in summary_df.columns:
-                                    try:
-                                        focus_stats = eval(summary_df["focus_stats"].iloc[0])
-                                        if focus_stats and len(focus_stats) > 0:
-                                            # Calculate average metrics across foci
-                                            avg_tubules_per_focus = np.mean([f.get('num_tubules', 0) for f in focus_stats if f.get('focus_id', 0) > 0])
-                                            avg_cells_per_focus = np.mean([f.get('total_cells', 0) for f in focus_stats if f.get('focus_id', 0) > 0])
-                                            avg_cells_per_tubule_in_foci = np.mean([f.get('mean_cells_per_tubule', 0) for f in focus_stats if f.get('focus_id', 0) > 0])
-                                            max_cells_in_any_focus = max([f.get('max_cells_in_tubule', 0) for f in focus_stats if f.get('focus_id', 0) > 0], default=0)
-                                            
-                                            result.update({
-                                                "avg_tubules_per_focus": avg_tubules_per_focus,
-                                                "avg_cells_per_focus": avg_cells_per_focus,
-                                                "avg_cells_per_tubule_in_foci": avg_cells_per_tubule_in_foci,
-                                                "max_cells_in_any_focus": max_cells_in_any_focus
-                                            })
-                                    except Exception as e:
-                                        self.logger.warning(f"Could not parse focus stats for {wsi_name}: {e}")
-                        except Exception as e:
-                            self.logger.warning(f"Could not read summary stats for {wsi_name}: {e}")
-                    
                     results.append(result)
                 except Exception as e:
                     self.logger.error(f"Error reading {grading_report_path}: {e}")
@@ -644,12 +649,12 @@ class KidneyGraderPipeline:
         self.logger.info(f"Evaluating {len(eval_df)} results with ground truth data")
         
         # Calculate evaluation metrics by parameter combination
-        param_groups = eval_df.groupby(['prob_thres', 'foci_dist'])
+        param_groups = eval_df.groupby(['prob_thres'])
         
         # Prepare metrics dataframe
         metrics_data = []
         
-        for (prob_thres, foci_dist), group in param_groups:
+        for (prob_thres), group in param_groups:
             y_true = group['tubulitis_score_ground_truth_numeric'].round().astype(int)
             y_pred = group['tubulitis_score_predicted_numeric'].round().astype(int)
             
@@ -670,10 +675,10 @@ class KidneyGraderPipeline:
                     pearson_corr, pearson_p = pearsonr(group['tubulitis_score_ground_truth_numeric'], group['tubulitis_score_predicted_numeric'])
                     spearman_corr, spearman_p = spearmanr(group['tubulitis_score_ground_truth_numeric'], group['tubulitis_score_predicted_numeric'])
                 except Exception as e:
-                    self.logger.warning(f"Could not calculate correlation for group (p={prob_thres}, d={foci_dist}): {e}")
+                    self.logger.warning(f"Could not calculate correlation for group (p={prob_thres}): {e}")
                     pearson_corr = pearson_p = spearman_corr = spearman_p = np.nan
             else:
-                self.logger.warning(f"Group (p={prob_thres}, d={foci_dist}) has only {len(group)} samples - skipping correlation calculation")
+                self.logger.warning(f"Group (p={prob_thres}) has only {len(group)} samples - skipping correlation calculation")
                 pearson_corr = pearson_p = spearman_corr = spearman_p = np.nan
             
             # Calculate Cohen's Kappa (agreement metric)
@@ -689,7 +694,6 @@ class KidneyGraderPipeline:
             
             metrics_data.append({
                 'prob_thres': prob_thres,
-                'foci_dist': foci_dist,
                 'sample_count': len(group),
                 'accuracy': accuracy,
                 'precision': precision,
@@ -751,14 +755,14 @@ class KidneyGraderPipeline:
             ]
             
             # Calculate correlations for each parameter combination
-            for (prob_thres, foci_dist), group in param_groups:
+            for (prob_thres), group in param_groups:
                 for feature in features:
                     if feature in group.columns:
                         # Calculate correlations
                         try:
                             # Skip if there are fewer than 2 samples or all values are identical
                             if len(group) < 2 or group[feature].nunique() <= 1 or group['tubulitis_score_ground_truth_numeric'].nunique() <= 1:
-                                self.logger.warning(f"Skipping correlation for feature {feature} in group (p={prob_thres}, d={foci_dist}): insufficient data variation")
+                                self.logger.warning(f"Skipping correlation for feature {feature} in group (p={prob_thres}): insufficient data variation")
                                 continue
                                 
                             pearson_corr, pearson_p = pearsonr(
@@ -772,7 +776,6 @@ class KidneyGraderPipeline:
                             
                             correlation_data.append({
                                 'prob_thres': prob_thres,
-                                'foci_dist': foci_dist,
                                 'feature': feature,
                                 'pearson_corr': pearson_corr,
                                 'pearson_p': pearson_p,
@@ -780,7 +783,7 @@ class KidneyGraderPipeline:
                                 'spearman_p': spearman_p
                             })
                         except Exception as e:
-                            self.logger.warning(f"Could not calculate correlation for {feature} in group (p={prob_thres}, d={foci_dist}): {e}")
+                            self.logger.warning(f"Could not calculate correlation for {feature} in group (p={prob_thres}): {e}")
             
             if correlation_data:
                 correlation_df = pd.DataFrame(correlation_data)
@@ -798,7 +801,7 @@ class KidneyGraderPipeline:
         markers = ['o', 's', 'D', '^', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x', 'd']
         colors = plt.cm.tab10.colors
         
-        for i, ((prob_thres, foci_dist), group) in enumerate(param_groups):
+        for i, ((prob_thres), group) in enumerate(param_groups):
             marker = markers[i % len(markers)]
             color = colors[i % len(colors)]
             
@@ -807,7 +810,7 @@ class KidneyGraderPipeline:
             y = group['tubulitis_score_predicted_numeric'] + np.random.normal(0, 0.05, len(group))
             
             plt.scatter(x, y, marker=marker, color=color, alpha=0.7, 
-                       label=f'p={prob_thres}, d={foci_dist}')
+                       label=f'p={prob_thres}')
         
         # Add perfect prediction line
         plt.plot([0, 3], [0, 3], 'k--', alpha=0.5)
@@ -858,7 +861,7 @@ class KidneyGraderPipeline:
                     # Pivot to get features as rows and parameters as columns
                     pivot_df = sig_correlations.pivot_table(
                         index='feature',
-                        columns=['prob_thres', 'foci_dist'],
+                        columns=['prob_thres'],
                         values='pearson_corr'
                     )
                     
@@ -914,8 +917,7 @@ class KidneyGraderPipeline:
         # 4. Confusion matrix for best parameters
         if best_params and 'accuracy' in best_params:
             best_acc_params = best_params['accuracy']
-            best_group = eval_df[(eval_df['prob_thres'] == best_acc_params['prob_thres']) & 
-                                (eval_df['foci_dist'] == best_acc_params['foci_dist'])]
+            best_group = eval_df[(eval_df['prob_thres'] == best_acc_params['prob_thres'])]
             
             if len(best_group) > 0:
                 plt.figure(figsize=(8, 6))
@@ -939,7 +941,7 @@ class KidneyGraderPipeline:
                                    xticklabels=[f't{i}' for i in range(4)],
                                    yticklabels=[f't{i}' for i in range(4)])
                         
-                        plt.title(f'Confusion Matrix (Best Parameters: p={best_acc_params["prob_thres"]}, d={best_acc_params["foci_dist"]})')
+                        plt.title(f'Confusion Matrix (Best Parameters: p={best_acc_params["prob_thres"]})')
                         plt.xlabel('Predicted T-score')
                         plt.ylabel('Ground Truth T-score')
                         
@@ -948,7 +950,7 @@ class KidneyGraderPipeline:
                         plt.savefig(cm_path)
                         plt.savefig(version_dir / "confusion_matrix.png")
                     else:
-                        self.logger.warning(f"Not enough unique classes for confusion matrix in best parameter group (p={best_acc_params['prob_thres']}, d={best_acc_params['foci_dist']})")
+                        self.logger.warning(f"Not enough unique classes for confusion matrix in best parameter group (p={best_acc_params['prob_thres']})")
                 except Exception as e:
                     self.logger.warning(f"Error creating confusion matrix: {e}")
                 plt.close()
@@ -1071,7 +1073,7 @@ class KidneyGraderPipeline:
                                            'tubulitis_score_ground_truth', 
                                            'tubulitis_score_ground_truth_numeric',
                                            'tubulitis_score_predicted',
-                                           'prob_thres', 'foci_dist']]
+                                           'prob_thres']]
             cells_vs_tscore_path_csv = self.summary_dir / "mean_cells_vs_tscore.csv"
             cells_vs_tscore_data.to_csv(cells_vs_tscore_path_csv, index=False)
             cells_vs_tscore_data.to_csv(version_dir / "mean_cells_vs_tscore.csv", index=False)
@@ -1091,7 +1093,7 @@ class KidneyGraderPipeline:
             if best_params:
                 f.write("Best parameter combinations:\n")
                 for metric, params in best_params.items():
-                    f.write(f"- Best for {metric}: prob_thres={params['prob_thres']}, foci_dist={params['foci_dist']} ")
+                    f.write(f"- Best for {metric}: prob_thres={params['prob_thres']} ")
                     f.write(f"(value: {params[metric]:.4f}, samples: {params['sample_count']})\n")
             else:
                 f.write("No best parameter combinations determined due to insufficient data\n")
@@ -1106,115 +1108,6 @@ class KidneyGraderPipeline:
         self.logger.info(f"Updated summary files in {self.summary_dir}")
         self.logger.info(f"Created versioned summary in {version_dir}")
 
-    def run_stage4(self, wsi_path: str, force: bool = False) -> dict:
-        import pandas as pd
-
-        self.logger.info("Running Stage 4: Grading")
-        self.logger.info("====== STAGE 4: GRADING STAGE STARTED ======")  # Add explicit stage marker
-
-        paths = self.get_output_paths(wsi_path)
-        param_tag = paths["param_tag"]
-
-        if paths["grading_report"].exists() and not force:
-            # Load existing grading report to check parameters
-            try:
-                with open(paths["grading_report"]) as f:
-                    grading_result = json.load(f)
-                
-                # Check if parameters match
-                existing_prob_thres = grading_result.get("prob_thres")
-                existing_foci_dist = grading_result.get("foci_dist")
-                
-                if (existing_prob_thres == self.prob_thres and 
-                    existing_foci_dist == self.foci_dist):
-                    # Parameters match, we can reuse the existing results
-                    self.logger.info(f"Grading already exists for parameters {param_tag}. Reusing results.")
-                    return grading_result
-                else:
-                    # Parameters don't match, need to recompute
-                    self.logger.info(f"Existing grading found but parameters differ (existing: prob_thres={existing_prob_thres}, foci_dist={existing_foci_dist}, current: prob_thres={self.prob_thres}, foci_dist={self.foci_dist}). Recomputing.")
-            except Exception as e:
-                # If there's an error reading the file, recompute to be safe
-                self.logger.warning(f"Error reading existing grading: {e}. Recomputing.")
-
-        if not paths["counts_csv"].exists():
-            raise FileNotFoundError(f"Required quantification CSV not found at {paths['counts_csv']}. Run Stage 3 first.")
-
-        # Load the per-tubule DataFrame
-        counts_df = pd.read_csv(paths["counts_csv"])
-
-        # Calculate score using loaded counts
-        grading_result = calculate_tubulitis_score(
-            counts_df=counts_df,
-            output_dir=paths["grading_report"].parent
-        )
-
-        # Check if we have ground truth T score
-        wsi_name = Path(wsi_path).stem
-        true_t_score = None
-        
-        # Try to get ground truth from banff_scores.csv if it exists
-        banff_csv = Path("banff_scores.csv")
-        if banff_csv.exists():
-            try:
-                import pandas as pd
-                banff_df = pd.read_csv(banff_csv)
-                
-                # Try to find this WSI in the ground truth data
-                wsi_filename = f"{wsi_name}.svs"
-                match = banff_df[banff_df["filename"] == wsi_filename]
-                
-                if not match.empty and "T" in match.columns and pd.notna(match["T"].values[0]):
-                    true_t_score = float(match["T"].values[0])
-                    self.logger.info(f"Found ground truth T score: {true_t_score} for {wsi_name}")
-            except Exception as e:
-                self.logger.warning(f"Could not load ground truth T score: {e}")
-
-        # Add parameter information to grading result
-        final_result = {
-            "wsi_name": paths["wsi_name"],
-            "tubulitis_score_predicted": grading_result["score"],
-            "grading_report": str(paths["grading_report"]),
-            "prob_thres": self.prob_thres,
-            "foci_dist": self.foci_dist,
-            "param_tag": param_tag
-        }
-        
-        # Add ground truth if available
-        if true_t_score is not None:
-            # Store ground truth in the same format as prediction (t0, t1, t2, t3)
-            final_result["tubulitis_score_ground_truth"] = f"t{int(round(true_t_score))}"
-            
-            # Extract numeric value from prediction for comparison
-            pred_score = float(grading_result["score"][1:]) if grading_result["score"].startswith("t") else float(grading_result["score"])
-            
-            # Calculate difference and correctness
-            final_result["score_difference"] = abs(pred_score - true_t_score)
-            final_result["correct_category"] = (round(pred_score) == round(true_t_score))
-            
-        # Ensure consistent ordering with tubulitis_score_ground_truth directly after tubulitis_score_predicted
-        ordered_keys = ["wsi_name", "tubulitis_score_predicted", "tubulitis_score_ground_truth", 
-                       "score_difference", "correct_category", "grading_report", 
-                       "prob_thres", "foci_dist", "param_tag"]
-        
-        # Create a new ordered dictionary with the desired key order
-        ordered_result = {}
-        for key in ordered_keys:
-            if key in final_result:
-                ordered_result[key] = final_result[key]
-                
-        # Add any remaining keys not in the ordered list
-        for key in final_result:
-            if key not in ordered_result:
-                ordered_result[key] = final_result[key]
-                
-        # Save the enhanced result with ordered keys
-        with open(paths["grading_report"], "w") as f:
-            json.dump(ordered_result, f, indent=2)
-
-        self.logger.info(f"Grading report saved to {paths['grading_report']}")
-        return final_result
-        
     def run_by_stage(self, wsi_path: str, stage: str, force: bool = False, visualise: bool = False, update_summary: bool = False) -> Dict[str, Any]:
         # Handle comma-separated stages (e.g., "3,4")
         if "," in stage:
@@ -1224,7 +1117,7 @@ class KidneyGraderPipeline:
             
             for single_stage in stages:
                 single_stage = single_stage.strip()
-                stage_map = {"segment": "1", "detect": "2", "quantify": "3", "grade": "4"}
+                stage_map = {"segment": "1", "detect": "2", "grade": "3"}
                 # Convert named stages to numbers if needed
                 if single_stage in stage_map:
                     single_stage = stage_map[single_stage]
@@ -1253,8 +1146,6 @@ class KidneyGraderPipeline:
             return self.run_stage2(wsi_path, force=force, visualise=visualise)
         elif stage == "3":
             return self.run_stage3(wsi_path, force=force, visualise=visualise)
-        elif stage == "4":
-            return self.run_stage4(wsi_path, force=force)
         elif stage == "all":
             return self.run_pipeline(wsi_path, force=force, visualise=visualise, update_summary=update_summary)
         else:
@@ -1266,9 +1157,7 @@ class KidneyGraderPipeline:
         self.logger.info("Stage 1 completed. Proceeding to Stage 2.")
         self.run_stage2(wsi_path, force=force, visualise=visualise)
         self.logger.info("Stage 2 completed. Proceeding to Stage 3.")
-        self.run_stage3(wsi_path, force=force, visualise=visualise)
-        self.logger.info("Stage 3 completed. Proceeding to Stage 4.")
-        result = self.run_stage4(wsi_path, force=force)
+        result = self.run_stage3(wsi_path, force=force, visualise=visualise)
         
         # Create summary files after each completed pipeline run
         if update_summary:
@@ -1286,24 +1175,21 @@ def main():
 
     parser.add_argument("--stage", 
         default="all",
-        help="Which stage(s) to run (default: all). Options: 1, 2, 3, 4, all, segment, detect, quantify, grade. "
-             "You can also specify multiple stages with commas, e.g., '3,4' for quantification and grading."
+        help="Which stage(s) to run (default: all). Options: 1, 2, 3, all, segment, detect, grade. "
+             "You can also specify multiple stages with commas, e.g., '2,3' for detection and grading."
     )
 
     parser.add_argument("--model_path", type=str, 
-        default="checkpoints/best_current_model.pth",
+        default="checkpoints/segmentation/kidney_grader_unet.pth",
         help="Path to segmentation model checkpoint"
     )
 
     parser.add_argument("--force", action="store_true", help="Recompute all stages even if outputs exist")
     parser.add_argument("--visualise", action="store_true", help="Visualise segmentation results")
 
-    parser.add_argument("--prob_thres", type=float, default=0.80,
+    parser.add_argument("--prob_thres", type=float, default=0.50,
                         help="Probability threshold (p ≥ value) used for inflammatory‑cell "
-                        "filtering in stages 2 & 3 [default: 0.80]")
-    
-    parser.add_argument("--foci_dist", type=int, default=200,
-                        help="Minimum distance between foci in pixels [default: 200]")
+                        "filtering in stages 2 & 3 [default: 0.50]")
                         
     parser.add_argument("--update_summary", action="store_true",
                         help="Update summary files after processing")
@@ -1316,15 +1202,8 @@ def main():
                         
     parser.add_argument("--instance_mask_class1", type=str, default=None,
                         help="Path to a custom instance mask for class 1 (tubules) to use instead of running segmentation")
-                        
-    parser.add_argument("--instance_mask_class4", type=str, default=None,
-                        help="Path to a custom instance mask for class 4 (glomeruli) to use instead of running segmentation")
 
     args = parser.parse_args()
-
-    # Validate that both instance masks are provided if either one is specified
-    if (args.instance_mask_class1 and not args.instance_mask_class4) or (args.instance_mask_class4 and not args.instance_mask_class1):
-        parser.error("Both --instance_mask_class1 and --instance_mask_class4 must be provided together")
 
     console.print("[bold cyan]KidneyGrader Pipeline Starting...[/bold cyan]")
     console.print(f"[green]Input:[/green] {args.input_path}")
@@ -1332,12 +1211,11 @@ def main():
     console.print(f"[green]Output directory:[/green] {args.output_dir}")
     if args.detection_json:
         console.print(f"[green]Using custom detection JSON:[/green] {args.detection_json}")
-    if args.instance_mask_class1 and args.instance_mask_class4:
-        console.print(f"[green]Using custom instance masks:[/green]")
+    if args.instance_mask_class1:
+        console.print(f"[green]Using custom instance mask:[/green]")
         console.print(f"  - Class 1 (tubules): {args.instance_mask_class1}")
-        console.print(f"  - Class 4 (glomeruli): {args.instance_mask_class4}")
 
-    stage_map = {"segment": "1", "detect": "2", "quantify": "3", "grade": "4"}
+    stage_map = {"segment": "1", "detect": "2", "grade": "3"}
     stage = stage_map.get(args.stage, args.stage)
 
     start = time.time()
@@ -1345,10 +1223,8 @@ def main():
         output_dir=args.output_dir, 
         model_path=args.model_path, 
         prob_thres=args.prob_thres, 
-        foci_dist=args.foci_dist,
         custom_detection_json=args.detection_json,
-        custom_instance_mask_class1=args.instance_mask_class1,
-        custom_instance_mask_class4=args.instance_mask_class4
+        custom_instance_mask_class1=args.instance_mask_class1
     )
     
     # Handle summary-only mode
@@ -1375,18 +1251,16 @@ def main():
 
     console.print(f"[bold green]Done in {end - start:.2f} seconds.[/bold green]")
 
-    if stage in ("3", "quantify"):
-        console.print("[bold yellow]Quantification complete.[/bold yellow]")
-        console.print(
-            f"Total tubules = {result['total_tubules']}, "
-            f"total inflammatory cells = {result['total_inflam_cells']}, "
-            f"mean cells/tubule = {result['summary_stats']['mean_cells_per_tubule']:.1f}"
-        )
-    elif stage in ("4", "grade"):
-        console.print(f"[bold yellow]Grading complete.[/bold yellow]")
+    if stage in ("3", "grade"):
+        console.print("[bold yellow]Grading complete.[/bold yellow]")
         console.print(f"WSI Name: {result['wsi_name']}")
         console.print(f"Tubulitis Grade: {result['tubulitis_score_predicted']}")
         console.print(f"Grading Report Path: {result['grading_report']}")
+        console.print(
+            f"Total tubules = {result['total_tubules']}, "
+            f"total inflammatory cells = {result['total_inflam_cells']}, "
+            f"mean cells/tubule = {result['summary_stats'].get('mean_cells_per_tubule', 0):.1f}"
+        )
     else:
         console.print(f"[bold yellow]Result:[/bold yellow] {json.dumps(result, indent=2)}")
         

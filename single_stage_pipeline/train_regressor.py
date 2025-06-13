@@ -1,3 +1,16 @@
+
+# run from the kidney-grader root directory:
+# python single_stage_pipeline/train_regressor.py --config single_stage_pipeline/configs/clam_regressor.yaml --mode single
+# python single_stage_pipeline/train_regressor.py --config single_stage_pipeline/configs/clam_regressor.yaml --mode cv --n_folds 5
+
+# run from the single_stage_pipeline directory:
+# python train_regressor.py --config configs/clam_regressor.yaml --mode single
+# python train_regressor.py --config configs/clam_regressor.yaml --mode cv --n_folds 5
+
+# train ensemble models:
+# python single_stage_pipeline/train_regressor.py --config single_stage_pipeline/configs/clam_regressor.yaml --mode ensemble --num_models 5
+
+
 import os
 import sys
 import yaml

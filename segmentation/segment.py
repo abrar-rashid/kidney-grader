@@ -204,11 +204,13 @@ def save_results(full_mask, wsi_name, output_dir, original_path=None, visualise=
     def downsample_array(arr, factor, copy: bool = False):
         if factor < 1:
             raise ValueError("factor must be a positive integer")
+
+        # Trim the edges so we take whole blocks only (matches cv2.resize).
         h, w   = arr.shape[:2]
         h_trim = (h // factor) * factor
         w_trim = (w // factor) * factor
 
-        # Strided nearest-neighbour pick
+        # Strided nearest-neighbour pick – *no allocation* here.
         ds_view = arr[:h_trim:factor, :w_trim:factor]
 
         return ds_view.copy() if copy else ds_view

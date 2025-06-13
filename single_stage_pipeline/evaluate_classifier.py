@@ -467,9 +467,9 @@ def evaluate_on_holdout_test(model_path: str, config_path: str, output_dir: str 
 
 def evaluate_cv_ensemble_on_holdout(cv_dir: str, config_path: str, output_dir: str = None) -> Dict[str, Any]:
     
-    print("="*70)
-    print("EVALUATING CV ENSEMBLE ON HELD-OUT TEST SET")
-    print("="*70)
+    print("="*80)
+    print("CLAM Tubulitis Classification - Held-Out Test Set Evaluation")
+    print("="*80)
     
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -477,15 +477,18 @@ def evaluate_cv_ensemble_on_holdout(cv_dir: str, config_path: str, output_dir: s
     cv_path = Path(cv_dir)
     fold_models = []
     
-    for fold_dir in cv_path.glob("cv_fold_*"):
+    for fold_dir in sorted(cv_path.glob("cv_fold_*")):
         best_model = fold_dir / "best_model.pth"
         if best_model.exists():
             fold_models.append(str(best_model))
+            print(f"Found model: {best_model}")
+        else:
+            print(f"Warning: No model found in {fold_dir}")
     
     if not fold_models:
         raise FileNotFoundError(f"No CV fold models found in {cv_dir}")
     
-    print(f"Found {len(fold_models)} CV fold models")
+    print(f"\nLoaded {len(fold_models)} models for ensemble evaluation")
     
     features_dir = config['data']['features_dir']
     holdout_file = Path(features_dir) / 'splits' / 'holdout_split.json'
@@ -494,7 +497,7 @@ def evaluate_cv_ensemble_on_holdout(cv_dir: str, config_path: str, output_dir: s
         holdout_split = json.load(f)
     
     test_slides = holdout_split['test']
-    print(f"Evaluating on {len(test_slides)} held-out test slides")
+    print(f"Test slides: {len(test_slides)}")
     
     test_split = {
         'train': [],
@@ -524,88 +527,205 @@ def evaluate_cv_ensemble_on_holdout(cv_dir: str, config_path: str, output_dir: s
         
         print(f"Loaded {len(models)} models for ensemble")
         
-        all_ensemble_predictions = []
+        all_fold_predictions = []
         all_targets = []
-        all_ensemble_probabilities = []
         slide_names = []
         
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Ensemble Evaluation"):
-                features = batch['features'].to(device)
-                labels = batch['labels'].to(device)
-                
-                batch_probs = []
-                for model in models:
+        print("\nEvaluating individual folds...")
+        for fold_idx, (model, model_path) in enumerate(zip(models, fold_models)):
+            fold_predictions = []
+            fold_targets = []
+            fold_slide_names = []
+            
+            with torch.no_grad():
+                for batch in test_loader:
+                    features = batch['features'].to(device)
+                    labels = batch['labels'].to(device)
+                    
                     probs = model.predict_proba(features)
-                    batch_probs.append(probs.cpu().numpy())
-                
-                ensemble_probs = np.mean(batch_probs, axis=0)
-                ensemble_preds = np.argmax(ensemble_probs, axis=-1)
-                
-                labels_np = labels.cpu().numpy()
-                
-                if len(ensemble_preds.shape) == 0:
-                    ensemble_preds = [ensemble_preds.item()]
-                    labels_np = [labels_np.item()]
-                    ensemble_probs = [ensemble_probs]
-                elif len(ensemble_preds.shape) == 1:
-                    ensemble_preds = ensemble_preds.tolist()
-                    labels_np = labels_np.tolist()
-                    ensemble_probs = ensemble_probs.tolist()
-                
-                all_ensemble_predictions.extend(ensemble_preds)
-                all_targets.extend(labels_np)
-                all_ensemble_probabilities.extend(ensemble_probs)
-                slide_names.extend(batch['slide_names'])
+                    preds = torch.argmax(probs, dim=-1).cpu().numpy()
+                    
+                    if len(preds.shape) == 0:
+                        preds = [preds.item()]
+                    
+                    fold_predictions.extend(preds)
+                    
+                    if fold_idx == 0: 
+                        labels_np = labels.cpu().numpy()
+                        if len(labels_np.shape) == 0:
+                            labels_np = [labels_np.item()]
+                        fold_targets.extend(labels_np)
+                        fold_slide_names.extend(batch['slide_names'])
+            
+            all_fold_predictions.append(np.array(fold_predictions))
+            if fold_idx == 0:
+                all_targets = np.array(fold_targets)
+                slide_names = fold_slide_names
+        
+        all_fold_predictions = np.array(all_fold_predictions) 
+        ensemble_predictions = []
+        
+        for i in range(len(all_targets)):
+            sample_preds = all_fold_predictions[:, i]
+            unique, counts = np.unique(sample_preds, return_counts=True)
+            ensemble_pred = unique[np.argmax(counts)]
+            ensemble_predictions.append(ensemble_pred)
+        
+        ensemble_predictions = np.array(ensemble_predictions)
         
         class_names = config.get('classification', {}).get('class_names', ["T0", "T1", "T2", "T3"])
         binary_threshold = config.get('classification', {}).get('binary_threshold', 1.5)
         
         ensemble_metrics = compute_metrics(
-            torch.tensor(all_ensemble_predictions), 
+            torch.tensor(ensemble_predictions), 
             torch.tensor(all_targets),
             class_names,
             binary_threshold
         )
         
+        per_fold_metrics = []
+        for fold_idx, fold_preds in enumerate(all_fold_predictions):
+            fold_metrics = compute_metrics(
+                torch.tensor(fold_preds), 
+                torch.tensor(all_targets),
+                class_names,
+                binary_threshold
+            )
+            per_fold_metrics.append({
+                'fold': fold_idx,
+                'accuracy': fold_metrics['accuracy'],
+                'macro_f1': fold_metrics['macro_f1'],
+                'quadratic_kappa': fold_metrics['quadratic_kappa'],
+                'mae': fold_metrics['mae'],
+                'binary_accuracy': fold_metrics['binary_accuracy']
+            })
+        
         ensemble_results_df = pd.DataFrame({
             'slide_name': slide_names,
-            'ensemble_prediction': all_ensemble_predictions,
+            'ensemble_prediction': ensemble_predictions,
             'target': all_targets,
-            'ensemble_T0_prob': [p[0] for p in all_ensemble_probabilities],
-            'ensemble_T1_prob': [p[1] for p in all_ensemble_probabilities],
-            'ensemble_T2_prob': [p[2] for p in all_ensemble_probabilities],
-            'ensemble_T3_prob': [p[3] for p in all_ensemble_probabilities]
+            'correct': ensemble_predictions == all_targets,
+            'abs_error': np.abs(ensemble_predictions - all_targets)
         })
+        
+        cm = confusion_matrix(all_targets, ensemble_predictions, labels=[0, 1, 2, 3])
         
         if output_dir:
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             
-            ensemble_results_df.to_csv(output_path / 'holdout_ensemble_results.csv', index=False)
+            ensemble_results_df.to_csv(output_path / 'holdout_ensemble_results_classifier.csv', index=False)
             
-            with open(output_path / 'holdout_ensemble_metrics.json', 'w') as f:
+            with open(output_path / 'holdout_ensemble_metrics_classifier.json', 'w') as f:
                 json.dump(format_metrics_for_logging(ensemble_metrics), f, indent=2)
+            
+            np.savetxt(output_path / 'confusion_matrix.csv', cm, delimiter=',', fmt='%d')
         
-        print(f"\n{'='*60}")
-        print("ENSEMBLE HELD-OUT TEST SET RESULTS")
-        print(f"{'='*60}")
+        from datetime import datetime
         
+        report_lines = []
+        report_lines.append("="*80)
+        report_lines.append("CLAM Tubulitis Classification - Held-Out Test Set Evaluation")
+        report_lines.append("="*80)
+        report_lines.append("")
+        
+        report_lines.append(f"Configuration:")
+        report_lines.append(f"  Test slides: {len(test_slides)}")
+        report_lines.append(f"  Successfully evaluated: {len(slide_names)}")
+        report_lines.append(f"  Model folds: {len(models)}")
+        report_lines.append(f"  Target column: T")
+        report_lines.append("")
+        
+        report_lines.append(f"ENSEMBLE PERFORMANCE:")
+        report_lines.append(f"{'='*40}")
         formatted_metrics = format_metrics_for_logging(ensemble_metrics)
-        for metric, value in formatted_metrics.items():
-            print(f"{metric}: {value:.4f}")
+        key_metrics = ['accuracy', 'macro_f1', 'weighted_f1', 'quadratic_kappa', 'mae', 
+                      'adjacent_accuracy', 'kendall_tau', 'binary_accuracy', 
+                      'high_grade_sensitivity', 'low_grade_specificity']
         
-        print_classification_report(
-            np.array(all_targets), 
-            np.array(all_ensemble_predictions),
-            class_names
-        )
+        for metric in key_metrics:
+            if metric in formatted_metrics:
+                report_lines.append(f"  {metric.replace('_', ' ').title()}: {formatted_metrics[metric]:.4f}")
+        report_lines.append("")
+        
+        report_lines.append(f"PER-FOLD PERFORMANCE:")
+        report_lines.append(f"{'='*40}")
+        for fold_metrics in per_fold_metrics:
+            report_lines.append(f"Fold {fold_metrics['fold']} ({len(slide_names)} slides):")
+            report_lines.append(f"  Accuracy: {fold_metrics['accuracy']:.4f}, Macro F1: {fold_metrics['macro_f1']:.4f}")
+            report_lines.append(f"  Quadratic Kappa: {fold_metrics['quadratic_kappa']:.4f}, MAE: {fold_metrics['mae']:.4f}")
+            report_lines.append(f"  Binary Accuracy: {fold_metrics['binary_accuracy']:.4f}")
+            report_lines.append("")
+        
+        report_lines.append(f"PER-SLIDE RESULTS (ENSEMBLE):")
+        report_lines.append(f"{'='*70}")
+        report_lines.append(f"{'Slide':<40} {'True':>6} {'Pred':>6} {'Correct':>8} {'|Error|':>8}")
+        report_lines.append(f"{'='*70}")
+        for _, row in ensemble_results_df.iterrows():
+            slide_short = row['slide_name'][-36:] if len(row['slide_name']) > 36 else row['slide_name']
+            correct_str = "✓" if row['correct'] else "✗"
+            report_lines.append(f"{slide_short:<40} T{int(row['target'])}     T{int(row['ensemble_prediction'])}     {correct_str:>6} {row['abs_error']:>8.0f}")
+        
+        report_lines.append("")
+        report_lines.append(f"Confusion Matrix (T Scores):")
+        report_lines.append(f"{'='*40}")
+        report_lines.append("     T0  T1  T2  T3")
+        for i, row in enumerate(cm):
+            report_lines.append(f"T{i}  {row[0]:3d} {row[1]:3d} {row[2]:3d} {row[3]:3d}")
+        
+        report_lines.append("")
+        report_lines.append("DETAILED CLASSIFICATION REPORT:")
+        report_lines.append("="*50)
+        
+        from sklearn.metrics import classification_report
+        class_report = classification_report(all_targets, ensemble_predictions, 
+                                           target_names=class_names, zero_division=0)
+        report_lines.extend(class_report.split('\n'))
+        
+        report_lines.append("")
+        report_lines.append(f"Additional Metrics:")
+        report_lines.append(f"  Quadratic Weighted Kappa: {ensemble_metrics['quadratic_kappa']:.4f}")
+        report_lines.append(f"  Mean Absolute Error: {ensemble_metrics['mae']:.4f}")
+        report_lines.append(f"  Adjacent Accuracy (±1): {ensemble_metrics['adjacent_accuracy']:.4f}")
+        report_lines.append(f"  Kendall's Tau: {ensemble_metrics['kendall_tau']:.4f}")
+        
+        report_lines.append("")
+        report_lines.append(f"Binary Classification (T0,T1 vs T2,T3):")
+        report_lines.append(f"  Binary Accuracy: {ensemble_metrics['binary_accuracy']:.4f}")
+        report_lines.append(f"  High-grade Sensitivity: {ensemble_metrics['high_grade_sensitivity']:.4f}")
+        report_lines.append(f"  Low-grade Specificity: {ensemble_metrics['low_grade_specificity']:.4f}")
+        
+        report_lines.append("")
+        report_lines.append(f"Report generated: {datetime.now()}")
+        
+        for line in report_lines:
+            print(line)
+        
+        if output_dir:
+            with open(output_path / 'evaluation_report.txt', 'w') as f:
+                f.write('\n'.join(report_lines))
+            print(f"\nReport saved to: {output_path / 'evaluation_report.txt'}")
+            
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                       xticklabels=['T0', 'T1', 'T2', 'T3'],
+                       yticklabels=['T0', 'T1', 'T2', 'T3'],
+                       cbar_kws={'label': 'Number of Samples'})
+            plt.xlabel('Predicted Class', fontsize=14)
+            plt.ylabel('True Class', fontsize=14)
+            plt.title('Test - Confusion Matrix', fontsize=16, fontweight='bold')
+            plt.tight_layout()
+            plt.savefig(output_path / 'confusion_matrix_heatmap.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"Confusion matrix heatmap saved to: {output_path / 'confusion_matrix_heatmap.png'}")
         
         return {
-            'ensemble_metrics': formatted_metrics,
+            'ensemble_metrics': format_metrics_for_logging(ensemble_metrics),
             'ensemble_predictions': ensemble_results_df,
+            'per_fold_metrics': per_fold_metrics,
+            'confusion_matrix': cm,
             'num_models': len(models),
-            'num_samples': len(all_ensemble_predictions)
+            'num_samples': len(ensemble_predictions)
         }
         
     finally:

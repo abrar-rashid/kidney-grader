@@ -14,6 +14,7 @@ venv/
 .kg_env/
 
 data/
+*.h5
 *.DS_Store
 
 *.pth
@@ -32,6 +33,8 @@ test/
 *.png
 *.tiff
 *.txt
+
+cv_results.yaml
 
 # temp/debug
 tmp/

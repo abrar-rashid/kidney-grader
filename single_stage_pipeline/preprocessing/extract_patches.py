@@ -15,11 +15,29 @@ import pandas as pd
 from rich.console import Console
 from rich.progress import Progress
 
-# Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
+# Robust path setup to work from both top-level and single_stage_pipeline directories
+script_dir = Path(__file__).parent
+root_dir = script_dir.parent.parent  # kidney-grader root
+single_stage_dir = script_dir.parent  # single_stage_pipeline
 
-from preprocessing.patch_extractor import KidneyPatchExtractor
-from preprocessing.uni_feature_extractor import UNIFeatureExtractor
+# Add both paths to ensure imports work from either directory
+sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(single_stage_dir))
+
+# Import preprocessing modules - try relative import first, then absolute
+try:
+    from preprocessing.patch_extractor import KidneyPatchExtractor
+except ImportError:
+    from single_stage_pipeline.preprocessing.patch_extractor import KidneyPatchExtractor
+
+# Import UNI feature extractor from top-level (preferred) or local copy as fallback
+try:
+    from uni_feature_extractor import UNIFeatureExtractor
+except ImportError:
+    try:
+        from preprocessing.uni_feature_extractor import UNIFeatureExtractor
+    except ImportError:
+        from single_stage_pipeline.preprocessing.uni_feature_extractor import UNIFeatureExtractor
 
 console = Console()
 

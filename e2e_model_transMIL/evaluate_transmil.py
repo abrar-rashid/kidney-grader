@@ -1,9 +1,12 @@
 
-# rnu from single_stage_pipeline directory
-# python evaluate_regressor.py --config configs/clam_regressor.yaml --model checkpoints_regressor/best_model.pth --output_dir evaluation_results/
+# all folds (ensemble):
+# python e2e_model_transMIL/evaluate_transmil.py --config e2e_model_transMIL/configs/transmil_regressor_config.yaml --checkpoints_dir e2e_model_transMIL/checkpoints_transmil --output_dir results_transmil_evaluation
 
-# python single_stage_pipeline/evaluate_regressor.py --config single_stage_pipeline/configs/clam_regressor.yaml --cv_dir single_stage_pipeline/checkpoints_regressor_cv/ --output_dir cv_evaluation_results/
+# specific fold:
+# python e2e_model_transMIL/evaluate_transmil.py --config e2e_model_transMIL/configs/transmil_regressor_config.yaml --checkpoints_dir e2e_model_transMIL/checkpoints_transmil --output_dir results_transmil_evaluation --fold 0
 
+# with visualisations (attention heatmaps):
+# python e2e_model_transMIL/evaluate_transmil.py --config e2e_model_transMIL/configs/transmil_regressor_config.yaml --checkpoints_dir e2e_model_transMIL/checkpoints_transmil --output_dir results_transmil_evaluation --fold 2 --visualise
 
 import os
 import sys
@@ -24,23 +27,22 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent))
 
-from models import create_clam_regressor
-from training import create_data_loaders, CLAMTrainer
+from models import create_transmil
+from training import create_data_loaders, TransMILTrainer
 
 warnings.filterwarnings("ignore")
 
 
-class CLAMRegressorEvaluator:    
+class TransMILRegressorEvaluator:    
     def __init__(self, config_path: str, model_path: str):
         self.config_path = config_path
         self.model_path = model_path
         
-        #load config yaml
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         
         self.device = torch.device(self.config['hardware']['device'])
-        self.model = create_clam_regressor(self.config).to(self.device)        
+        self.model = create_transmil(self.config).to(self.device)        
         self.load_model()
         
         print(f"Loaded model from: {model_path}")
@@ -88,7 +90,6 @@ class CLAMRegressorEvaluator:
                 targets.extend(targs)
                 slide_names.extend(batch['slide_names'])
                 
-                # store attention weights for analysis
                 attn_weights = results['attention_weights'].squeeze().cpu().numpy()
                 attention_weights_list.append(attn_weights)
         
@@ -118,20 +119,15 @@ class CLAMRegressorEvaluator:
         rmse = np.sqrt(mse)
         r2 = r2_score(targets, predictions)
         
-        # correlation metrics
         pearson_corr, pearson_p = pearsonr(predictions, targets)
         spearman_corr, spearman_p = spearmanr(predictions, targets)
         
-        # classification-style metrics (exact match)
         rounded_preds = np.round(predictions).astype(int)
         rounded_targets = np.round(targets).astype(int)
         exact_accuracy = np.mean(rounded_preds == rounded_targets)
         
-        # within-1 accuracy (predictions within 1 score of target)
         within_1_accuracy = np.mean(np.abs(predictions - targets) <= 1.0)
         
-        # quadratic weighted kappa (important for ordinal classification)
-        # clip to valid range [0, 3] for T scores
         clipped_preds = np.clip(rounded_preds, 0, 3)
         clipped_targets = np.clip(rounded_targets, 0, 3)
         quadratic_kappa = cohen_kappa_score(clipped_targets, clipped_preds, weights='quadratic')
@@ -170,7 +166,7 @@ class CLAMRegressorEvaluator:
         
         plt.xlabel('Ground Truth Tubulitis Score', fontsize=12)
         plt.ylabel('Predicted Tubulitis Score', fontsize=12)
-        plt.title(f'CLAM Regressor: Predictions vs Ground Truth ({split_name})', fontsize=14)
+        plt.title(f'TransMIL Regressor: Predictions vs Ground Truth ({split_name})', fontsize=14)
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -329,17 +325,16 @@ def create_test_only_loader(
     return test_loader
 
 
-def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output_dir: str = None) -> Dict[str, Any]:
+def evaluate_transmil_on_holdout_test(model_path: str, config_path: str, output_dir: str = None) -> Dict[str, Any]:
     print("="*60)
-    print("EVALUATING REGRESSOR ON HELD-OUT TEST SET")
+    print("EVALUATING TRANSMIL ON HELD-OUT TEST SET")
     print("="*60)
     
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # load holdout split
     features_dir = config['data']['features_dir']
-    holdout_file = Path(features_dir) / 'splits' / 'holdout_split_regressor.json'
+    holdout_file = Path(features_dir) / 'splits' / 'holdout_split.json'
     
     if not holdout_file.exists():
         raise FileNotFoundError(f"Holdout split file not found: {holdout_file}")
@@ -350,14 +345,13 @@ def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output
     test_slides = holdout_split['test']
     print(f"Evaluating on {len(test_slides)} held-out test slides")
     
-    # create test data loader
     test_split = {
         'train': [],
         'val': [],
         'test': test_slides
     }
     
-    temp_split_file = Path(features_dir) / 'splits' / 'temp_holdout_test_regressor.json'
+    temp_split_file = Path(features_dir) / 'splits' / 'temp_holdout_test_transmil.json'
     with open(temp_split_file, 'w') as f:
         json.dump(test_split, f, indent=2)
     
@@ -367,7 +361,7 @@ def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output
         )
 
         device = torch.device(config['hardware']['device'])
-        model = create_clam_regressor(config).to(device)
+        model = create_transmil(config).to(device)
         
         checkpoint = torch.load(model_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -413,7 +407,6 @@ def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output
         pearson_corr, pearson_p = pearsonr(all_predictions, all_targets)
         spearman_corr, spearman_p = spearmanr(all_predictions, all_targets)
         
-        # round regressions to nearest integer for classification-style metrics
         rounded_preds = np.round(all_predictions).astype(int)
         rounded_targets = np.round(all_targets).astype(int)
         
@@ -422,8 +415,6 @@ def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output
         
         exact_accuracy = np.mean(rounded_preds == rounded_targets)
         adjacent_accuracy = np.mean(np.abs(rounded_preds - rounded_targets) <= 1)
-        
-        # quadratic weighted kappa
         quadratic_kappa = cohen_kappa_score(rounded_targets, rounded_preds, weights='quadratic')
         
         metrics = {
@@ -452,15 +443,15 @@ def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             
-            results_df.to_csv(output_path / 'holdout_test_results_regressor.csv', index=False)
+            results_df.to_csv(output_path / 'holdout_test_results_transmil.csv', index=False)
             
-            with open(output_path / 'holdout_test_metrics_regressor.json', 'w') as f:
+            with open(output_path / 'holdout_test_metrics_transmil.json', 'w') as f:
                 json.dump(metrics, f, indent=2)
             
             print(f"Results saved to: {output_path}")
         
         print(f"\n{'='*50}")
-        print("HELD-OUT TEST SET RESULTS (REGRESSOR)")
+        print("HELD-OUT TEST SET RESULTS (TRANSMIL)")
         print(f"{'='*50}")
         
         for metric, value in metrics.items():
@@ -481,10 +472,10 @@ def evaluate_regressor_on_holdout_test(model_path: str, config_path: str, output
             temp_split_file.unlink()
 
 
-def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, output_dir: str = None) -> Dict[str, Any]:
+def evaluate_transmil_cv_ensemble_on_holdout(cv_dir: str, config_path: str, output_dir: str = None) -> Dict[str, Any]:
     
     print("="*80)
-    print("CLAM Tubulitis Scoring - Held-Out Test Set Evaluation")
+    print("TransMIL Tubulitis Scoring - Held-Out Test Set Evaluation")
     print("="*80)
     
     with open(config_path, 'r') as f:
@@ -506,7 +497,6 @@ def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, out
     
     print(f"\nLoaded {len(fold_models)} models for ensemble evaluation")
     
-    # get test slides from holdout split (same as classifier)
     features_dir = config['data']['features_dir']
     holdout_file = Path(features_dir) / 'splits' / 'holdout_split.json'
     
@@ -519,14 +509,13 @@ def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, out
     test_slides = holdout_split['test']
     print(f"Test slides: {len(test_slides)}")
     
-    # create temporary split file with only test slides
     temp_split = {
         'train': [],
         'val': [],
         'test': test_slides
     }
     
-    temp_split_file = Path(features_dir) / 'splits' / 'temp_holdout_test_regressor.json'
+    temp_split_file = Path(features_dir) / 'splits' / 'temp_holdout_test_transmil.json'
     with open(temp_split_file, 'w') as f:
         json.dump(temp_split, f)
     
@@ -539,7 +528,7 @@ def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, out
         models = []
         
         for model_path in fold_models:
-            model = create_clam_regressor(config).to(device)
+            model = create_transmil(config).to(device)
             checkpoint = torch.load(model_path, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
             model.eval()
@@ -570,7 +559,7 @@ def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, out
                     
                     fold_predictions.extend(preds)
                     
-                    if fold_idx == 0:  # only collect once
+                    if fold_idx == 0:
                         labels_np = labels.cpu().numpy()
                         if len(labels_np.shape) == 0:
                             labels_np = [labels_np.item()]
@@ -582,7 +571,7 @@ def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, out
                 all_targets = np.array(fold_targets)
                 slide_names = fold_slide_names
         
-        all_fold_predictions = np.array(all_fold_predictions)  # shape: (n_folds, n_samples)
+        all_fold_predictions = np.array(all_fold_predictions)
         ensemble_predictions = np.mean(all_fold_predictions, axis=0)
         
         mse = mean_squared_error(all_targets, ensemble_predictions)
@@ -659,21 +648,21 @@ def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, out
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             
-            ensemble_results_df.to_csv(output_path / 'holdout_ensemble_results_regressor.csv', index=False)
+            ensemble_results_df.to_csv(output_path / 'holdout_ensemble_results_transmil.csv', index=False)
             
-            with open(output_path / 'holdout_ensemble_metrics_regressor.json', 'w') as f:
+            with open(output_path / 'holdout_ensemble_metrics_transmil.json', 'w') as f:
                 json.dump(ensemble_metrics, f, indent=2)
             
-            np.savetxt(output_path / 'confusion_matrix_regressor.csv', cm, delimiter=',', fmt='%d')
+            np.savetxt(output_path / 'confusion_matrix_transmil.csv', cm, delimiter=',', fmt='%d')
             
             per_fold_df = pd.DataFrame(per_fold_metrics)
-            per_fold_df.to_csv(output_path / 'per_fold_metrics_regressor.csv', index=False)
+            per_fold_df.to_csv(output_path / 'per_fold_metrics_transmil.csv', index=False)
         
         from datetime import datetime
         
         report_lines = []
         report_lines.append("="*80)
-        report_lines.append("CLAM Regressor - Held-Out Test Set Evaluation (FIXED)")
+        report_lines.append("TransMIL Regressor - Held-Out Test Set Evaluation")
         report_lines.append("="*80)
         report_lines.append("")
         
@@ -762,31 +751,32 @@ def evaluate_regressor_cv_ensemble_on_holdout(cv_dir: str, config_path: str, out
         if temp_split_file.exists():
             temp_split_file.unlink()
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate CLAM regressor models")
+    parser = argparse.ArgumentParser(description="Evaluate TransMIL regressor models")
     parser.add_argument("--fold", type=str, help="Specific fold to evaluate (e.g., cv_fold_0)")
     parser.add_argument("--all-folds", action="store_true", help="Evaluate all available folds")
-    parser.add_argument("--checkpoints-dir", type=str, default="checkpoints_regressor", help="Directory containing model checkpoints (default: checkpoints_regressor)")
-    parser.add_argument("--config", type=str, default="configs/clam_regressor_training.yaml", help="Path to config file")
+    parser.add_argument("--checkpoints-dir", type=str, default="checkpoints_transmil", help="Directory containing model checkpoints (default: checkpoints_transmil)")
+    parser.add_argument("--config", type=str, default="configs/transmil.yaml", help="Path to config file")
     parser.add_argument("--holdout", action="store_true", help="Evaluate single model on held-out test set")
     parser.add_argument("--cv-ensemble", action="store_true", help="Evaluate CV ensemble on held-out test set")
     parser.add_argument("--model-path", type=str, help="Path to specific model for holdout evaluation")
     parser.add_argument("--output-dir", type=str, help="Directory to save evaluation results")
     args = parser.parse_args()
     
-    print("CLAM Regressor Model Evaluation")
+    print("TransMIL Regressor Model Evaluation")
     print("=" * 50)
     
     if args.holdout:
         if not args.model_path:
             raise ValueError("--model-path required for held-out evaluation")
-        evaluate_regressor_on_holdout_test(args.model_path, args.config, args.output_dir)
+        evaluate_transmil_on_holdout_test(args.model_path, args.config, args.output_dir)
         return
     
     elif args.cv_ensemble:
         if not args.checkpoints_dir:
             raise ValueError("--checkpoints-dir required for CV ensemble evaluation")
-        evaluate_regressor_cv_ensemble_on_holdout(args.checkpoints_dir, args.config, args.output_dir)
+        evaluate_transmil_cv_ensemble_on_holdout(args.checkpoints_dir, args.config, args.output_dir)
         return
     
     config_path = args.config
@@ -820,7 +810,6 @@ def main():
             return
         
         if args.fold:
-            # evaluate specific fold
             selected_folds = [f for f in fold_models if f['fold_name'] == args.fold]
             if not selected_folds:
                 print(f"Fold '{args.fold}' not found!")
@@ -830,7 +819,6 @@ def main():
         elif args.all_folds:
             folds_to_evaluate = fold_models
         else:
-            # default is evaluate first fold only
             folds_to_evaluate = [fold_models[0]]
             print(f"\n🏆 Evaluating fold: {fold_models[0]['fold_name']} (use --all-folds to evaluate all)")
         
@@ -841,9 +829,9 @@ def main():
             
             best_model_path = selected_fold['model_path']
             
-            evaluator = CLAMRegressorEvaluator(config_path, best_model_path)
+            evaluator = TransMILRegressorEvaluator(config_path, best_model_path)
             
-            save_dir = f"evaluation_results_regressor_{selected_fold['fold_name']}"
+            save_dir = f"evaluation_results_transmil_{selected_fold['fold_name']}"
             all_results = evaluator.evaluate_all_splits(save_dir)
             
             print(f"\nEvaluation completed for {selected_fold['fold_name']}!")
@@ -855,26 +843,25 @@ def main():
         
         if len(folds_to_evaluate) == 1 and not args.fold and not args.all_folds:
             print(f"\nTo evaluate other folds:")
-            print(f"   python evaluate_regressor.py --all-folds  # Evaluate all folds")
+            print(f"   python evaluate_transmil.py --all-folds  # Evaluate all folds")
             for fold in fold_models:
-                print(f"   python evaluate_regressor.py --fold {fold['fold_name']}")
+                print(f"   python evaluate_transmil.py --fold {fold['fold_name']}")
             print(f"\nTo evaluate on held-out test set:")
-            print(f"   python evaluate_regressor.py --holdout --model-path {fold_models[0]['model_path']}")
-            print(f"   python evaluate_regressor.py --cv-ensemble --checkpoints-dir {args.checkpoints_dir}")
+            print(f"   python evaluate_transmil.py --holdout --model-path {fold_models[0]['model_path']}")
+            print(f"   python evaluate_transmil.py --cv-ensemble --checkpoints-dir {args.checkpoints_dir}")
         
     elif (checkpoints_dir / "ensemble_summary.json").exists():
         print("Found ensemble training results")
         with open(checkpoints_dir / "ensemble_summary.json") as f:
             ensemble_summary = json.load(f)
         
-        # use the best model from ensemble
         best_model_idx = np.argmin([m['best_val_mse'] for m in ensemble_summary['models']])
         best_model_path = ensemble_summary['models'][best_model_idx]['model_path']
         print(f"Using best ensemble model: {best_model_path}")
         
-        evaluator = CLAMRegressorEvaluator(config_path, best_model_path)
+        evaluator = TransMILRegressorEvaluator(config_path, best_model_path)
         
-        save_dir = "evaluation_results_regressor_ensemble"
+        save_dir = "evaluation_results_transmil_ensemble"
         all_results = evaluator.evaluate_all_splits(save_dir)
         
         print(f"\nEvaluation completed!")
@@ -888,9 +875,9 @@ def main():
         best_model_path = checkpoints_dir / "best_model.pth"
         print(f"Using single best model: {best_model_path}")
         
-        evaluator = CLAMRegressorEvaluator(config_path, best_model_path)
+        evaluator = TransMILRegressorEvaluator(config_path, best_model_path)
         
-        save_dir = "evaluation_results_regressor"
+        save_dir = "evaluation_results_transmil"
         all_results = evaluator.evaluate_all_splits(save_dir)
         
         print(f"\nEvaluation completed!")
@@ -902,7 +889,7 @@ def main():
     
     else:
         print(f"No trained models found in {checkpoints_dir}")
-        print("Please train models first using train_regressor.py")
+        print("Please train models first using train_transmil.py")
 
 
 if __name__ == "__main__":

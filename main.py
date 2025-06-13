@@ -49,6 +49,71 @@ class KidneyGraderPipeline:
         self.individual_reports_dir.mkdir(exist_ok=True)
         self.summary_dir.mkdir(exist_ok=True)
 
+    def validate_wsi_file(self, wsi_path: str) -> Dict[str, Any]:
+        """Validate WSI file before processing to detect corruption or other issues.
+        
+        Returns:
+            Dict with validation results: {'valid': bool, 'error': str, 'size_mb': float, 'dimensions': tuple}
+        """
+        wsi_path = Path(wsi_path)
+        
+        # Check if file exists
+        if not wsi_path.exists():
+            return {'valid': False, 'error': f'File does not exist: {wsi_path}', 'size_mb': 0, 'dimensions': None}
+        
+        # Check file size
+        try:
+            file_size_mb = wsi_path.stat().st_size / (1024 * 1024)
+        except Exception as e:
+            return {'valid': False, 'error': f'Cannot read file size: {e}', 'size_mb': 0, 'dimensions': None}
+        
+        # Check if file is too small (likely corrupted) or too large (might cause issues)
+        if file_size_mb < 10:  # Less than 10MB is suspicious for a WSI
+            return {'valid': False, 'error': f'File too small ({file_size_mb:.1f} MB), likely corrupted', 'size_mb': file_size_mb, 'dimensions': None}
+        
+        if file_size_mb > 50000:  # Greater than 50GB is extremely large
+            return {'valid': False, 'error': f'File extremely large ({file_size_mb:.1f} MB), processing may fail', 'size_mb': file_size_mb, 'dimensions': None}
+        
+        # Try to open the file with TiffSlide to check for TIFF corruption
+        try:
+            from tiffslide import TiffSlide
+            slide = TiffSlide(str(wsi_path))
+            
+            # Check if we can read basic properties
+            dimensions = slide.dimensions
+            level_count = slide.level_count
+            
+            # Check for reasonable dimensions
+            if dimensions[0] <= 0 or dimensions[1] <= 0:
+                slide.close()
+                return {'valid': False, 'error': f'Invalid dimensions: {dimensions}', 'size_mb': file_size_mb, 'dimensions': dimensions}
+            
+            # Check if dimensions are extremely large (might cause memory issues)
+            total_pixels = dimensions[0] * dimensions[1]
+            if total_pixels > 500_000_000_000:  # 500 billion pixels
+                slide.close()
+                return {'valid': False, 'error': f'Extremely large image ({total_pixels:,} pixels), may cause memory issues', 'size_mb': file_size_mb, 'dimensions': dimensions}
+            
+            # Try to read a small region to test for TIFF directory corruption
+            try:
+                test_region = slide.read_region((0, 0), slide.level_count - 1, (100, 100))
+                test_region.close()
+            except Exception as e:
+                slide.close()
+                return {'valid': False, 'error': f'TIFF directory corruption detected: {e}', 'size_mb': file_size_mb, 'dimensions': dimensions}
+            
+            slide.close()
+            
+            self.logger.info(f"WSI validation passed: {wsi_path.name} ({file_size_mb:.1f} MB, {dimensions[0]}x{dimensions[1]})")
+            return {'valid': True, 'error': None, 'size_mb': file_size_mb, 'dimensions': dimensions}
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'tiff' in error_msg and ('directory' in error_msg or 'allocate memory' in error_msg):
+                return {'valid': False, 'error': f'TIFF file corrupted: {e}', 'size_mb': file_size_mb, 'dimensions': None}
+            else:
+                return {'valid': False, 'error': f'Cannot open WSI file: {e}', 'size_mb': file_size_mb, 'dimensions': None}
+
     def get_output_paths(self, wsi_path: str) -> Dict[str, Path]:
         wsi_name = Path(wsi_path).stem
         
@@ -85,6 +150,18 @@ class KidneyGraderPipeline:
 
         self.logger.info(f"Running Stage 1: Segmentation for {wsi_path}")
         wsi_name = Path(wsi_path).stem
+        
+        # Validate WSI file before processing
+        validation = self.validate_wsi_file(wsi_path)
+        if not validation['valid']:
+            error_msg = f"WSI validation failed for {wsi_name}: {validation['error']}"
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        # Log validation info
+        if validation['dimensions']:
+            self.logger.info(f"WSI validated: {validation['size_mb']:.1f} MB, {validation['dimensions'][0]}x{validation['dimensions'][1]} pixels")
+        
         paths = self.get_output_paths(wsi_path)
         
         # Use the shared segmentation directory
@@ -138,10 +215,25 @@ class KidneyGraderPipeline:
                 "instance_mask_paths": instance_mask_paths
             }
 
-        # run segmentation if not cached
-        result = run_segment(wsi_path, output_dir=output_dir, model_path=self.model_path, visualise=visualise)
-        return result
-
+        # run segmentation if not cached - wrap in try-except for better error handling
+        try:
+            self.logger.info(f"Starting segmentation for {wsi_name} (file size: {validation['size_mb']:.1f} MB)")
+            result = run_segment(wsi_path, output_dir=output_dir, model_path=self.model_path, visualise=visualise)
+            self.logger.info(f"Segmentation completed successfully for {wsi_name}")
+            return result
+        except Exception as e:
+            error_msg = f"Segmentation failed for {wsi_name}: {e}"
+            self.logger.error(error_msg)
+            # Clean up any partial files that might have been created
+            try:
+                if output_dir.exists():
+                    for file in output_dir.glob("*"):
+                        if file.is_file():
+                            file.unlink()
+                            self.logger.info(f"Cleaned up partial file: {file}")
+            except Exception as cleanup_error:
+                self.logger.warning(f"Failed to clean up partial files: {cleanup_error}")
+            raise RuntimeError(error_msg)
 
     def run_stage2(self, wsi_path, force: bool = False, visualise: bool = False) -> dict:
         from detection.detect import run_inflammatory_cell_detection
@@ -187,6 +279,10 @@ class KidneyGraderPipeline:
                 
                 self.logger.info(f"Filtered inflammatory cells from {total_points} to {len(filtered_points)} using threshold {self.prob_thres}")
                 
+                # Generate visualization if requested
+                if visualise:
+                    self._run_detection_visualization(wsi_path, mm_coords, output_dir)
+                
                 return {
                     "wsi_name": wsi_name,
                     "prob_threshold": self.prob_thres,
@@ -221,20 +317,24 @@ class KidneyGraderPipeline:
             
             self.logger.info(f"Filtered inflammatory cells from {total_points} to {len(filtered_points)} using threshold {self.prob_thres}")
             
+            # Generate visualization if requested
+            if visualise:
+                self._run_detection_visualization(wsi_path, mm_coords, output_dir)
+            
             return {
                 "wsi_name": wsi_name,
                 "prob_threshold": self.prob_thres,
                 "inflam_cell_coords_path": str(json_detection_path),
             }
 
-        # If not cached, run detection
+        # If not cached, run detection without visualization
         output_dir.mkdir(exist_ok=True)
         self.logger.info(f"Running inflammatory cell detection as the file does not exist or force flag is set.")
         run_inflammatory_cell_detection(
             wsi_path=wsi_path,
             output_dir=output_dir,
             model_path="checkpoints/detection/",
-            visualise=visualise
+            visualise=False  # Always false, we'll use separate visualization
         )
 
         # verify after detection
@@ -263,11 +363,33 @@ class KidneyGraderPipeline:
         
         self.logger.info(f"Filtered inflammatory cells from {total_points} to {len(filtered_points)} using threshold {self.prob_thres}")
         
+        # Generate visualization if requested
+        if visualise:
+            self._run_detection_visualization(wsi_path, mm_coords, output_dir)
+        
         return {
             "wsi_name": wsi_name,
             "prob_threshold": self.prob_thres,
             "inflam_cell_coords_path": str(json_detection_path),
         }
+    
+    def _run_detection_visualization(self, wsi_path, mm_coords, output_dir):
+        """Generate detection visualization using the separate visualise_overlay.py"""
+        try:
+            from detection.visualise_overlay import generate_tiff_overlay, load_coordinates
+            
+            self.logger.info("Generating detection visualization using visualise_overlay.py")
+            
+            # Generate visualization
+            output_path = output_dir / "inflammatory_cells_overlay.tiff"
+            generate_tiff_overlay(mm_coords, wsi_path, output_path)
+            
+            self.logger.info(f"Detection visualization saved to {output_dir}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to generate detection visualization: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
 
     def run_stage3(self, wsi_path: str, force: bool = False, visualise: bool = False) -> dict:
         import tifffile as tiff
@@ -319,15 +441,27 @@ class KidneyGraderPipeline:
                                 dtype=np.float32,
                             )
                             
+                            # Load counts data for highlighting top tubules
+                            counts_csv_path = Path(paths["counts_csv"])
+                            existing_counts_df = None
+                            if counts_csv_path.exists():
+                                try:
+                                    existing_counts_df = pd.read_csv(counts_csv_path)
+                                except Exception as e:
+                                    self.logger.warning(f"Could not load counts CSV for visualization: {e}")
+                            
                             # Create visualization directory
                             vis_dir = Path(paths["counts_csv"]).parent / "visualization"
                             
-                            # Generate overlay
+                            # Generate overlay with top tubules highlighted
                             overlay_path = create_quantification_overlay(
                                 wsi_path=wsi_path,
                                 tubule_mask=tubule_mask,
                                 cell_coords=mm_coords,
-                                output_dir=vis_dir
+                                output_dir=vis_dir,
+                                counts_df=existing_counts_df,
+                                highlight_top_tubules=5,
+                                highlight_style="circle"
                             )
                             
                             if overlay_path:
@@ -452,12 +586,15 @@ class KidneyGraderPipeline:
                 # Create visualization directory
                 vis_dir = grading_dir / "visualization"
                 
-                # Generate overlay
+                # Generate overlay with top tubules highlighted
                 visualization_path = create_quantification_overlay(
                     wsi_path=wsi_path,
                     tubule_mask=tubule_mask,
                     cell_coords=mm_coords,
-                    output_dir=vis_dir
+                    output_dir=vis_dir,
+                    counts_df=counts_df,
+                    highlight_top_tubules=5,
+                    highlight_style="circle"
                 )
                 
                 if visualization_path:
@@ -500,12 +637,12 @@ class KidneyGraderPipeline:
             "wsi_name": paths["wsi_name"],
             "total_inflam_cells": int(len(cell_coords)),
             "total_tubules": int(len(np.unique(tubule_mask)) - 1),
-            "tubule_counts_csv": str(paths["counts_csv"]),
-            "per_tubule_inflam_cell_counts": per_tubule_counts,
             "mean_cells_per_tubule": float(summary_stats.get('mean_cells_per_tubule', 0.0)),
             "summary_stats": convert_numpy_types(summary_stats),
             "prob_thres": self.prob_thres,
-            "param_tag": paths["param_tag"]
+            "param_tag": paths["param_tag"],
+            "tubule_counts_csv": str(paths["counts_csv"]),
+            "per_tubule_inflam_cell_counts": per_tubule_counts
         }
         
         # Add visualization path if available
@@ -550,7 +687,7 @@ class KidneyGraderPipeline:
         return combined_result
 
     def create_summary_files(self, update_summary: bool = True) -> None:
-        """Create or update summary files with all results across parameter sets.
+        """Create or update summary files with separate results for each probability threshold.
         
         Args:
             update_summary: Whether to update the main summary files
@@ -600,6 +737,40 @@ class KidneyGraderPipeline:
                         "prob_thres": data.get("prob_thres", None),
                         "param_tag": data.get("param_tag", param_dir.name)
                     }
+                    
+                    # Also read quantification data if available
+                    quantification_path = param_dir / "quantification.json"
+                    if quantification_path.exists():
+                        try:
+                            with open(quantification_path) as f:
+                                quant_data = json.load(f)
+                            # Add quantification metrics to result
+                            result.update({
+                                "mean_cells_per_tubule": quant_data.get("mean_cells_per_tubule", None),
+                                "total_inflam_cells": quant_data.get("total_inflam_cells", None),
+                                "total_tubules": quant_data.get("total_tubules", None),
+                                "summary_stats": quant_data.get("summary_stats", {}),
+                                "total_cells": quant_data.get("total_cells", None),
+                                "std_cells_per_tubule": quant_data.get("std_cells_per_tubule", None),
+                                "max_cells_in_tubule": quant_data.get("max_cells_in_tubule", None),
+                                "mean_cells_top_1pct": quant_data.get("mean_cells_top_1pct", None),
+                                "mean_cells_top_5pct": quant_data.get("mean_cells_top_5pct", None),
+                                "mean_cells_top_10pct": quant_data.get("mean_cells_top_10pct", None)
+                            })
+                            # Add summary stats fields as top-level columns for easier access
+                            if "summary_stats" in quant_data:
+                                stats = quant_data["summary_stats"]
+                                result.update({
+                                    "total_cells": stats.get("total_cells", None),
+                                    "std_cells_per_tubule": stats.get("std_cells_per_tubule", None),
+                                    "max_cells_in_tubule": stats.get("max_cells_in_tubule", None),
+                                    "mean_cells_top_1pct": stats.get("mean_cells_top_1pct", None),
+                                    "mean_cells_top_5pct": stats.get("mean_cells_top_5pct", None),
+                                    "mean_cells_top_10pct": stats.get("mean_cells_top_10pct", None)
+                                })
+                        except Exception as e:
+                            self.logger.warning(f"Could not read quantification data from {quantification_path}: {e}")
+                    
                     results.append(result)
                 except Exception as e:
                     self.logger.error(f"Error reading {grading_report_path}: {e}")
@@ -625,19 +796,19 @@ class KidneyGraderPipeline:
                     errors='coerce'  # Convert errors to NaN
                 )
         
-        # Create directory for summary files
+        # Create main summary directory
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save the raw data
-        scores_csv = self.summary_dir / "aggregated_scores.csv"
+        # Save combined raw data (for backwards compatibility)
+        scores_csv = self.summary_dir / "aggregated_scores_all_thresholds.csv"
         results_df.to_csv(scores_csv, index=False)
-        self.logger.info(f"Saved aggregated scores to {scores_csv}")
+        self.logger.info(f"Saved combined aggregated scores to {scores_csv}")
         
-        # Set up versioned directory
+        # Set up main versioned directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        version_dir = self.summary_dir / f"version_{timestamp}"
-        version_dir.mkdir(parents=True, exist_ok=True)
-        results_df.to_csv(version_dir / "aggregated_scores.csv", index=False)
+        main_version_dir = self.summary_dir / f"version_{timestamp}_combined"
+        main_version_dir.mkdir(parents=True, exist_ok=True)
+        results_df.to_csv(main_version_dir / "aggregated_scores_all_thresholds.csv", index=False)
         
         # Filter to only include results with ground truth for evaluation
         eval_df = results_df.dropna(subset=['tubulitis_score_ground_truth_numeric', 'tubulitis_score_predicted_numeric'])
@@ -648,13 +819,35 @@ class KidneyGraderPipeline:
             
         self.logger.info(f"Evaluating {len(eval_df)} results with ground truth data")
         
-        # Calculate evaluation metrics by parameter combination
-        param_groups = eval_df.groupby(['prob_thres'])
+        # Group by probability threshold and create separate summaries
+        param_groups = eval_df.groupby('prob_thres')
         
-        # Prepare metrics dataframe
-        metrics_data = []
+        # Store metrics for all thresholds (for comparison)
+        all_metrics_data = []
         
-        for (prob_thres), group in param_groups:
+        # Process each probability threshold separately
+        for prob_thres, group in param_groups:
+            # Extract the actual float value if prob_thres is a tuple  
+            if isinstance(prob_thres, tuple):
+                prob_thres = prob_thres[0]
+                
+            self.logger.info(f"Creating summary for probability threshold: {prob_thres}")
+            
+            # Create separate directory for this threshold
+            threshold_dir = self.summary_dir / f"prob_thres_{prob_thres}"
+            threshold_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create versioned directory for this threshold
+            threshold_version_dir = threshold_dir / f"version_{timestamp}"
+            threshold_version_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save threshold-specific data
+            threshold_csv = threshold_dir / "aggregated_scores.csv"
+            group.to_csv(threshold_csv, index=False)
+            group.to_csv(threshold_version_dir / "aggregated_scores.csv", index=False)
+            self.logger.info(f"Saved threshold-specific scores to {threshold_csv}")
+            
+            # Calculate metrics for this threshold
             y_true = group['tubulitis_score_ground_truth_numeric'].round().astype(int)
             y_pred = group['tubulitis_score_predicted_numeric'].round().astype(int)
             
@@ -675,10 +868,10 @@ class KidneyGraderPipeline:
                     pearson_corr, pearson_p = pearsonr(group['tubulitis_score_ground_truth_numeric'], group['tubulitis_score_predicted_numeric'])
                     spearman_corr, spearman_p = spearmanr(group['tubulitis_score_ground_truth_numeric'], group['tubulitis_score_predicted_numeric'])
                 except Exception as e:
-                    self.logger.warning(f"Could not calculate correlation for group (p={prob_thres}): {e}")
+                    self.logger.warning(f"Could not calculate correlation for threshold {prob_thres}: {e}")
                     pearson_corr = pearson_p = spearman_corr = spearman_p = np.nan
             else:
-                self.logger.warning(f"Group (p={prob_thres}) has only {len(group)} samples - skipping correlation calculation")
+                self.logger.warning(f"Threshold {prob_thres} has only {len(group)} samples - skipping correlation calculation")
                 pearson_corr = pearson_p = spearman_corr = spearman_p = np.nan
             
             # Calculate Cohen's Kappa (agreement metric)
@@ -692,36 +885,967 @@ class KidneyGraderPipeline:
             weights = 1.0 / (1.0 + np.abs(group['tubulitis_score_ground_truth_numeric'] - group['tubulitis_score_predicted_numeric']))
             weighted_accuracy = np.mean(weights)
             
-            metrics_data.append({
+            # Calculate additional comprehensive metrics
+            from sklearn.metrics import f1_score as sklearn_f1_score
+            
+            # F1 scores (macro, micro, weighted)
+            f1_macro = sklearn_f1_score(y_true, y_pred, average='macro', zero_division=0)
+            f1_micro = sklearn_f1_score(y_true, y_pred, average='micro', zero_division=0)  
+            f1_weighted = sklearn_f1_score(y_true, y_pred, average='weighted', zero_division=0)
+            
+            # Class-specific accuracy (per-class recall)
+            from sklearn.metrics import classification_report
+            clf_report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+            
+            # Extract class-specific accuracies (recall for each class)
+            class_accuracies = {}
+            for i in range(4):  # t0, t1, t2, t3
+                class_key = str(i)
+                if class_key in clf_report:
+                    class_accuracies[f'class_{i}_accuracy'] = clf_report[class_key]['recall']
+                else:
+                    class_accuracies[f'class_{i}_accuracy'] = 0.0
+            
+            # Quadratic weighted kappa
+            try:
+                from sklearn.metrics import cohen_kappa_score
+                kappa_quadratic = cohen_kappa_score(y_true, y_pred, weights='quadratic')
+            except Exception as e:
+                self.logger.warning(f"Could not calculate quadratic weighted kappa: {e}")
+                kappa_quadratic = np.nan
+            
+            # Exact accuracy (already calculated as 'accuracy' above)
+            exact_accuracy = accuracy
+            
+            threshold_metrics = {
                 'prob_thres': prob_thres,
                 'sample_count': len(group),
-                'accuracy': accuracy,
-                'precision': precision,
-                'recall': recall,
-                'f1_score': f1,
+                # Basic metrics
+                'exact_accuracy': exact_accuracy,
+                'within_1_grade_accuracy': within_one,
+                'weighted_accuracy': weighted_accuracy,
+                # Classification metrics  
+                'precision_weighted': precision,
+                'recall_weighted': recall,
+                'f1_score_weighted': f1_weighted,
+                'f1_score_macro': f1_macro,
+                'f1_score_micro': f1_micro,
+                # Regression metrics
                 'mae': mae,
                 'mse': mse,
                 'rmse': rmse,
+                # Correlation coefficients
                 'pearson_corr': pearson_corr,
-                'pearson_p': pearson_p,
+                'pearson_p_value': pearson_p,
                 'spearman_corr': spearman_corr,
-                'spearman_p': spearman_p,
-                'kappa': kappa,
-                'accuracy_within_one': within_one,
-                'weighted_accuracy': weighted_accuracy
-            })
+                'spearman_p_value': spearman_p,
+                # Agreement metrics
+                'cohens_kappa': kappa,
+                'quadratic_weighted_kappa': kappa_quadratic,
+                # Class-specific accuracies
+                **class_accuracies
+            }
+            
+            # Create comprehensive text report
+            report_lines = [
+                f"COMPREHENSIVE EVALUATION METRICS REPORT",
+                f"=====================================",
+                f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Probability Threshold: {prob_thres}",
+                f"Number of Samples: {len(group)}",
+                f"",
+                f"ACCURACY METRICS",
+                f"----------------",
+                f"Exact Accuracy:           {exact_accuracy:.4f} ({exact_accuracy*100:.2f}%)",
+                f"Within-1-Grade Accuracy:  {within_one:.4f} ({within_one*100:.2f}%)",
+                f"Weighted Accuracy:        {weighted_accuracy:.4f} ({weighted_accuracy*100:.2f}%)",
+                f"",
+                f"F1 SCORES",
+                f"---------",
+                f"F1-Score (Weighted):      {f1_weighted:.4f}",
+                f"F1-Score (Macro):         {f1_macro:.4f}",
+                f"F1-Score (Micro):         {f1_micro:.4f}",
+                f"",
+                f"CLASS-SPECIFIC ACCURACY (Recall per class)",
+                f"------------------------------------------"
+            ]
+            
+            for i in range(4):
+                class_acc = class_accuracies.get(f'class_{i}_accuracy', 0.0)
+                n_true = np.sum(y_true == i)
+                report_lines.append(f"Class t{i} Accuracy:       {class_acc:.4f} ({class_acc*100:.2f}%) [n={n_true}]")
+            
+            report_lines.extend([
+                f"",
+                f"REGRESSION METRICS",
+                f"------------------",
+                f"Mean Absolute Error:      {mae:.4f}",
+                f"Mean Squared Error:       {mse:.4f}",
+                f"Root Mean Squared Error:  {rmse:.4f}",
+                f"",
+                f"CORRELATION COEFFICIENTS",
+                f"------------------------",
+                f"Pearson Correlation:      {pearson_corr:.4f} (p={pearson_p:.4f})",
+                f"Spearman Correlation:     {spearman_corr:.4f} (p={spearman_p:.4f})",
+                f"",
+                f"AGREEMENT METRICS",
+                f"-----------------",
+                f"Cohen's Kappa:            {kappa:.4f}",
+                f"Quadratic Weighted Kappa: {kappa_quadratic:.4f}",
+                f"",
+                f"KAPPA INTERPRETATION",
+                f"--------------------"
+            ])
+            
+            # Add kappa interpretation
+            def interpret_kappa(k):
+                if np.isnan(k):
+                    return "Not Available"
+                elif k < 0:
+                    return "Poor (worse than chance)"
+                elif k <= 0.20:
+                    return "Slight"
+                elif k <= 0.40:
+                    return "Fair"
+                elif k <= 0.60:
+                    return "Moderate"
+                elif k <= 0.80:
+                    return "Substantial"
+                else:
+                    return "Almost Perfect"
+            
+            report_lines.extend([
+                f"Cohen's Kappa:            {interpret_kappa(kappa)}",
+                f"Quadratic Weighted Kappa: {interpret_kappa(kappa_quadratic)}",
+                f"",
+                f"CONFUSION MATRIX",
+                f"----------------"
+            ])
+            
+            # Add confusion matrix to report
+            from sklearn.metrics import confusion_matrix
+            cm = confusion_matrix(y_true, y_pred, labels=[0,1,2,3])
+            report_lines.append("         Predicted")
+            report_lines.append("       t0  t1  t2  t3")
+            for i in range(4):
+                line = f"True t{i}"
+                for j in range(4):
+                    line += f"{cm[i,j]:4d}"
+                report_lines.append(line)
+            
+            report_lines.extend([
+                f"",
+                f"CLASSIFICATION REPORT",
+                f"--------------------"
+            ])
+            
+            # Add detailed classification report
+            clf_report_str = classification_report(y_true, y_pred, 
+                                                 target_names=['t0', 't1', 't2', 't3'],
+                                                 zero_division=0)
+            report_lines.extend(clf_report_str.split('\n'))
+            
+            # Save the comprehensive text report
+            report_path = threshold_dir / "comprehensive_evaluation_report.txt"
+            with open(report_path, 'w') as f:
+                f.write('\n'.join(report_lines))
+            
+            report_version_path = threshold_version_dir / "comprehensive_evaluation_report.txt"
+            with open(report_version_path, 'w') as f:
+                f.write('\n'.join(report_lines))
+                
+            self.logger.info(f"Saved comprehensive evaluation report to {report_path}")
+            
+            # Save metrics for this threshold
+            threshold_metrics_df = pd.DataFrame([threshold_metrics])
+            metrics_path = threshold_dir / "evaluation_metrics.csv"
+            threshold_metrics_df.to_csv(metrics_path, index=False)
+            threshold_metrics_df.to_csv(threshold_version_dir / "evaluation_metrics.csv", index=False)
+            self.logger.info(f"Saved threshold-specific metrics to {metrics_path}")
+            
+            # Add to overall metrics collection
+            all_metrics_data.append(threshold_metrics)
+            
+            # Create threshold-specific visualizations
+            self._create_threshold_visualizations(group, threshold_dir, threshold_version_dir, prob_thres)
         
-        metrics_df = pd.DataFrame(metrics_data)
+        # Save combined metrics comparison (for comparing across thresholds)
+        if all_metrics_data:
+            all_metrics_df = pd.DataFrame(all_metrics_data)
+            comparison_path = self.summary_dir / "threshold_comparison_metrics.csv"
+            all_metrics_df.to_csv(comparison_path, index=False)
+            all_metrics_df.to_csv(main_version_dir / "threshold_comparison_metrics.csv", index=False)
+            self.logger.info(f"Saved threshold comparison metrics to {comparison_path}")
+            
+            # Create comparison visualizations
+            self._create_threshold_comparison_visualizations(all_metrics_df, eval_df, self.summary_dir, main_version_dir)
         
-        # Save metrics to CSV
-        metrics_path = self.summary_dir / "evaluation_metrics.csv"
-        metrics_df.to_csv(metrics_path, index=False)
-        metrics_df.to_csv(version_dir / "evaluation_metrics.csv", index=False)
-        self.logger.info(f"Saved evaluation metrics to {metrics_path}")
+        self.logger.info(f"Summary files created with separate folders for each probability threshold in {self.summary_dir}")
+
+
+    def _create_threshold_visualizations(self, group_df, threshold_dir, version_dir, prob_thres):
+        """Create visualizations for a specific probability threshold."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import numpy as np
+        from scipy.stats import pearsonr, spearmanr
+        from sklearn.metrics import confusion_matrix
         
-        # Find best parameter combinations based on different metrics
-        best_params = {}
+        # 1. Predicted vs Ground Truth scatter plot
+        plt.figure(figsize=(8, 6))
         
+        x = group_df['tubulitis_score_ground_truth_numeric']
+        y = group_df['tubulitis_score_predicted_numeric']
+        
+        # Add jitter to avoid overplotting
+        x_jitter = x + np.random.normal(0, 0.05, len(x))
+        y_jitter = y + np.random.normal(0, 0.05, len(y))
+        
+        plt.scatter(x_jitter, y_jitter, alpha=0.7, s=50)
+        
+        # Add perfect prediction line
+        plt.plot([0, 3], [0, 3], 'k--', alpha=0.5, label='Perfect prediction')
+        
+        # Add regression line
+        if len(x) >= 2 and x.nunique() > 1 and y.nunique() > 1:
+            z = np.polyfit(x, y, 1)
+            p = np.poly1d(z)
+            plt.plot(np.sort(x), p(np.sort(x)), "r--", alpha=0.8, label='Trend line')
+            
+            # Calculate correlation
+            try:
+                pearson_corr, _ = pearsonr(x, y)
+                corr_text = f'r={pearson_corr:.3f}'
+            except:
+                corr_text = 'r=N/A'
+        else:
+            corr_text = 'r=N/A'
+        
+        plt.title(f'Predicted vs Ground Truth (prob_thres={prob_thres}, {corr_text})')
+        plt.xlabel('Ground Truth T-score')
+        plt.ylabel('Predicted T-score')
+        plt.grid(alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        
+        pred_vs_truth_path = threshold_dir / "predicted_vs_ground_truth.png"
+        plt.savefig(pred_vs_truth_path)
+        plt.savefig(version_dir / "predicted_vs_ground_truth.png")
+        plt.close()
+        
+        # 2. Confusion Matrix
+        if len(group_df) > 1:
+            plt.figure(figsize=(6, 5))
+            
+            y_true = group_df['tubulitis_score_ground_truth_numeric'].round().astype(int)
+            y_pred = group_df['tubulitis_score_predicted_numeric'].round().astype(int)
+            
+            try:
+                unique_classes = np.unique(np.concatenate([y_true, y_pred]))
+                if len(unique_classes) > 1:
+                    cm = confusion_matrix(y_true, y_pred)
+                    
+                    # Normalize confusion matrix
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+                        cm_norm = np.nan_to_num(cm_norm, nan=0)
+                    
+                    # Create heatmap
+                    sns.heatmap(cm_norm, annot=cm, fmt='d', cmap='Blues', 
+                               xticklabels=[f't{i}' for i in range(4)],
+                               yticklabels=[f't{i}' for i in range(4)])
+                    
+                    plt.title(f'Confusion Matrix (prob_thres={prob_thres})')
+                    plt.xlabel('Predicted T-score')
+                    plt.ylabel('Ground Truth T-score')
+                    
+                    cm_path = threshold_dir / "confusion_matrix.png"
+                    plt.savefig(cm_path)
+                    plt.savefig(version_dir / "confusion_matrix.png")
+                    plt.close()
+            except Exception as e:
+                self.logger.warning(f"Error creating confusion matrix for threshold {prob_thres}: {e}")
+                plt.close()
+        
+        # 3. Error distribution
+        plt.figure(figsize=(8, 5))
+        
+        error = np.abs(group_df['tubulitis_score_ground_truth_numeric'] - group_df['tubulitis_score_predicted_numeric'])
+        
+        plt.hist(error, bins=np.arange(0, 4.5, 0.5), alpha=0.7, edgecolor='black')
+        plt.title(f'Prediction Error Distribution (prob_thres={prob_thres})')
+        plt.xlabel('Absolute Error')
+        plt.ylabel('Frequency')
+        plt.grid(alpha=0.3)
+        
+        error_dist_path = threshold_dir / "error_distribution.png"
+        plt.savefig(error_dist_path)
+        plt.savefig(version_dir / "error_distribution.png")
+        plt.close()
+        
+        # 4. Feature correlation analysis
+        features = [
+            'mean_cells_per_tubule', 'total_inflam_cells', 'total_tubules', 
+            'total_cells', 'std_cells_per_tubule', 'max_cells_in_tubule',
+            'mean_cells_top_1pct', 'mean_cells_top_5pct', 'mean_cells_top_10pct'
+        ]
+        
+        correlation_data = []
+        for feature in features:
+            if feature in group_df.columns:
+                try:
+                    # Skip if there are fewer than 2 samples or all values are identical
+                    if len(group_df) < 2 or group_df[feature].nunique() <= 1 or group_df['tubulitis_score_ground_truth_numeric'].nunique() <= 1:
+                        self.logger.warning(f"Skipping correlation for feature {feature} in threshold {prob_thres}: insufficient data variation")
+                        continue
+                        
+                    pearson_corr, pearson_p = pearsonr(
+                        group_df[feature], 
+                        group_df['tubulitis_score_ground_truth_numeric']
+                    )
+                    spearman_corr, spearman_p = spearmanr(
+                        group_df[feature], 
+                        group_df['tubulitis_score_ground_truth_numeric']
+                    )
+                    
+                    correlation_data.append({
+                        'feature': feature,
+                        'pearson_corr': pearson_corr,
+                        'pearson_p': pearson_p,
+                        'spearman_corr': spearman_corr,
+                        'spearman_p': spearman_p
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Could not calculate correlation for {feature} in threshold {prob_thres}: {e}")
+        
+        if correlation_data:
+            correlation_df = pd.DataFrame(correlation_data)
+            correlation_path = threshold_dir / "feature_correlations.csv"
+            correlation_df.to_csv(correlation_path, index=False)
+            correlation_df.to_csv(version_dir / "feature_correlations.csv", index=False)
+            self.logger.info(f"Saved feature correlations to {correlation_path}")
+            
+            # Create feature correlation heatmap
+            if len(correlation_data) > 0:
+                plt.figure(figsize=(10, 6))
+                
+                # Filter to significant correlations
+                sig_correlations = correlation_df[correlation_df['pearson_p'] < 0.05]
+                
+                if not sig_correlations.empty:
+                    # Create bar plot of significant correlations
+                    plt.barh(sig_correlations['feature'], sig_correlations['pearson_corr'])
+                    plt.axvline(x=0, color='k', linestyle='--', alpha=0.3)
+                    plt.title(f'Feature Correlation with Ground Truth T-score (prob_thres={prob_thres})')
+                    plt.xlabel('Pearson Correlation')
+                    plt.grid(alpha=0.3)
+                    
+                    feature_corr_path = threshold_dir / "feature_correlations.png"
+                    plt.savefig(feature_corr_path)
+                    plt.savefig(version_dir / "feature_correlations.png")
+                else:
+                    self.logger.warning(f"No significant correlations found for threshold {prob_thres}")
+                plt.close()
+        
+        # 5. Feature correlation with prediction error
+        group_df_with_error = group_df.copy()
+        group_df_with_error['error'] = np.abs(group_df['tubulitis_score_predicted_numeric'] - group_df['tubulitis_score_ground_truth_numeric'])
+        
+        error_corr_data = []
+        for feature in features:
+            if feature in group_df_with_error.columns:
+                try:
+                    # Skip if there are fewer than 2 samples or all values are identical
+                    if len(group_df_with_error) < 2 or group_df_with_error[feature].nunique() <= 1 or group_df_with_error['error'].nunique() <= 1:
+                        self.logger.warning(f"Skipping error correlation for feature {feature} in threshold {prob_thres}: insufficient data variation")
+                        continue
+                        
+                    pearson_corr, pearson_p = pearsonr(group_df_with_error[feature], group_df_with_error['error'])
+                    error_corr_data.append({
+                        'feature': feature,
+                        'correlation': pearson_corr,
+                        'p_value': pearson_p
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Could not calculate error correlation for {feature} in threshold {prob_thres}: {e}")
+        
+        if error_corr_data:
+            error_corr_df = pd.DataFrame(error_corr_data)
+            error_corr_df = error_corr_df.sort_values('correlation', ascending=False)
+            
+            # Create bar plot
+            plt.figure(figsize=(10, 6))
+            plt.barh(error_corr_df['feature'], error_corr_df['correlation'])
+            plt.axvline(x=0, color='k', linestyle='--', alpha=0.3)
+            plt.title(f'Feature Correlation with Prediction Error (prob_thres={prob_thres})')
+            plt.xlabel('Pearson Correlation')
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
+            
+            # Save plot
+            error_corr_path = threshold_dir / "error_correlations.png"
+            plt.savefig(error_corr_path)
+            plt.savefig(version_dir / "error_correlations.png")
+            
+            # Save to CSV
+            error_corr_df.to_csv(threshold_dir / "error_correlations.csv", index=False)
+            error_corr_df.to_csv(version_dir / "error_correlations.csv", index=False)
+            plt.close()
+        
+        # 6. Mean cells per tubule correlation analysis
+        if 'mean_cells_per_tubule' in group_df.columns:
+            plt.figure(figsize=(15, 5))
+            
+            # Subplot 1: Correlation with ground truth T-score
+            plt.subplot(1, 3, 1)
+            sns.regplot(
+                data=group_df, 
+                x='tubulitis_score_ground_truth_numeric',
+                y='mean_cells_per_tubule', 
+                scatter_kws={'alpha': 0.7, 's': 50},
+                line_kws={'color': 'red'}
+            )
+            
+            # Calculate correlation
+            try:
+                if len(group_df) >= 2 and group_df['mean_cells_per_tubule'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        group_df['tubulitis_score_ground_truth_numeric'],
+                        group_df['mean_cells_per_tubule']
+                    )
+                    plt.title(f'Ground Truth vs Mean Cells/Tubule\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                else:
+                    plt.title('Ground Truth vs Mean Cells/Tubule\n(Insufficient data variation)')
+            except Exception as e:
+                self.logger.warning(f"Error calculating correlation: {e}")
+                plt.title('Ground Truth vs Mean Cells/Tubule')
+            
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Mean Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            # Subplot 2: Correlation with predicted T-score
+            plt.subplot(1, 3, 2)
+            sns.regplot(
+                data=group_df, 
+                x='tubulitis_score_predicted_numeric',
+                y='mean_cells_per_tubule', 
+                scatter_kws={'alpha': 0.7, 's': 50},
+                line_kws={'color': 'green'}
+            )
+            
+            try:
+                if len(group_df) >= 2 and group_df['mean_cells_per_tubule'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        group_df['tubulitis_score_predicted_numeric'],
+                        group_df['mean_cells_per_tubule']
+                    )
+                    plt.title(f'Predicted vs Mean Cells/Tubule\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                else:
+                    plt.title('Predicted vs Mean Cells/Tubule')
+            except Exception as e:
+                plt.title('Predicted vs Mean Cells/Tubule')
+            
+            plt.xlabel('Predicted T-score')
+            plt.ylabel('Mean Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            # Subplot 3: Distribution by T-score category
+            plt.subplot(1, 3, 3)
+            
+            # Ensure T-score is formatted correctly for the box plot
+            group_df_copy = group_df.copy()
+            group_df_copy['t_score_category'] = group_df_copy['tubulitis_score_ground_truth_numeric'].round().astype(int).map(lambda x: f't{x}')
+            
+            # Create box plot
+            sns.boxplot(data=group_df_copy, x='t_score_category', y='mean_cells_per_tubule')
+            plt.title(f'Distribution of Mean Cells per Tubule by T-score (prob_thres={prob_thres})')
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Mean Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save the plots
+            cells_vs_tscore_path = threshold_dir / "mean_cells_vs_tscore.png"
+            plt.savefig(cells_vs_tscore_path)
+            plt.savefig(version_dir / "mean_cells_vs_tscore.png")
+            
+            # Save the data points for this specific relationship
+            cells_vs_tscore_data = group_df[['wsi_name', 'mean_cells_per_tubule', 
+                                           'tubulitis_score_ground_truth', 
+                                           'tubulitis_score_ground_truth_numeric',
+                                           'tubulitis_score_predicted',
+                                           'prob_thres']]
+            cells_vs_tscore_path_csv = threshold_dir / "mean_cells_vs_tscore.csv"
+            cells_vs_tscore_data.to_csv(cells_vs_tscore_path_csv, index=False)
+            cells_vs_tscore_data.to_csv(version_dir / "mean_cells_vs_tscore.csv", index=False)
+            
+            self.logger.info(f"Saved mean cells per tubule vs T-score analysis to {cells_vs_tscore_path}")
+            plt.close()
+        
+        # 7. Max cells per tubule correlation analysis
+        if 'max_cells_in_tubule' in group_df.columns:
+            plt.figure(figsize=(15, 5))
+            
+            # Subplot 1: Correlation with ground truth T-score
+            plt.subplot(1, 3, 1)
+            sns.regplot(
+                data=group_df, 
+                x='tubulitis_score_ground_truth_numeric',
+                y='max_cells_in_tubule', 
+                scatter_kws={'alpha': 0.7, 's': 50},
+                line_kws={'color': 'red'}
+            )
+            
+            # Calculate correlation
+            try:
+                if len(group_df) >= 2 and group_df['max_cells_in_tubule'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        group_df['tubulitis_score_ground_truth_numeric'],
+                        group_df['max_cells_in_tubule']
+                    )
+                    plt.title(f'Ground Truth vs Max Cells/Tubule\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                else:
+                    plt.title('Ground Truth vs Max Cells/Tubule\n(Insufficient data variation)')
+            except Exception as e:
+                self.logger.warning(f"Error calculating max cells correlation: {e}")
+                plt.title('Ground Truth vs Max Cells/Tubule')
+            
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Max Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            # Subplot 2: Correlation with predicted T-score
+            plt.subplot(1, 3, 2)
+            sns.regplot(
+                data=group_df, 
+                x='tubulitis_score_predicted_numeric',
+                y='max_cells_in_tubule', 
+                scatter_kws={'alpha': 0.7, 's': 50},
+                line_kws={'color': 'green'}
+            )
+            
+            try:
+                if len(group_df) >= 2 and group_df['max_cells_in_tubule'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        group_df['tubulitis_score_predicted_numeric'],
+                        group_df['max_cells_in_tubule']
+                    )
+                    plt.title(f'Predicted vs Max Cells/Tubule\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                else:
+                    plt.title('Predicted vs Max Cells/Tubule')
+            except Exception as e:
+                plt.title('Predicted vs Max Cells/Tubule')
+            
+            plt.xlabel('Predicted T-score')
+            plt.ylabel('Max Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            # Subplot 3: Distribution by T-score category
+            plt.subplot(1, 3, 3)
+            group_df_copy = group_df.copy()
+            group_df_copy['t_score_category'] = group_df_copy['tubulitis_score_ground_truth_numeric'].round().astype(int).map(lambda x: f't{x}')
+            sns.boxplot(data=group_df_copy, x='t_score_category', y='max_cells_in_tubule')
+            plt.title('Max Cells/Tubule Distribution by T-score')
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Max Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save plot
+            max_cells_corr_path = threshold_dir / "max_cells_correlation_analysis.png"
+            plt.savefig(max_cells_corr_path)
+            plt.savefig(version_dir / "max_cells_correlation_analysis.png")
+            plt.close()
+            
+            self.logger.info(f"Saved max cells correlation analysis to {max_cells_corr_path}")
+        
+        # 8. Total inflammatory cells correlation analysis
+        if 'total_inflam_cells' in group_df.columns:
+            plt.figure(figsize=(15, 5))
+            
+            # Subplot 1: Correlation with ground truth T-score
+            plt.subplot(1, 3, 1)
+            sns.regplot(
+                data=group_df, 
+                x='tubulitis_score_ground_truth_numeric',
+                y='total_inflam_cells', 
+                scatter_kws={'alpha': 0.7, 's': 50},
+                line_kws={'color': 'red'}
+            )
+            
+            # Calculate correlation
+            try:
+                if len(group_df) >= 2 and group_df['total_inflam_cells'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        group_df['tubulitis_score_ground_truth_numeric'],
+                        group_df['total_inflam_cells']
+                    )
+                    plt.title(f'Ground Truth vs Total Inflammatory Cells\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                else:
+                    plt.title('Ground Truth vs Total Inflammatory Cells\n(Insufficient data variation)')
+            except Exception as e:
+                self.logger.warning(f"Error calculating total cells correlation: {e}")
+                plt.title('Ground Truth vs Total Inflammatory Cells')
+            
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Total Inflammatory Cells')
+            plt.grid(True, alpha=0.3)
+            
+            # Subplot 2: Correlation with predicted T-score
+            plt.subplot(1, 3, 2)
+            sns.regplot(
+                data=group_df, 
+                x='tubulitis_score_predicted_numeric',
+                y='total_inflam_cells', 
+                scatter_kws={'alpha': 0.7, 's': 50},
+                line_kws={'color': 'green'}
+            )
+            
+            try:
+                if len(group_df) >= 2 and group_df['total_inflam_cells'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        group_df['tubulitis_score_predicted_numeric'],
+                        group_df['total_inflam_cells']
+                    )
+                    plt.title(f'Predicted vs Total Inflammatory Cells\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                else:
+                    plt.title('Predicted vs Total Inflammatory Cells')
+            except Exception as e:
+                plt.title('Predicted vs Total Inflammatory Cells')
+            
+            plt.xlabel('Predicted T-score')
+            plt.ylabel('Total Inflammatory Cells')
+            plt.grid(True, alpha=0.3)
+            
+            # Subplot 3: Distribution by T-score category
+            plt.subplot(1, 3, 3)
+            group_df_copy = group_df.copy()
+            group_df_copy['t_score_category'] = group_df_copy['tubulitis_score_ground_truth_numeric'].round().astype(int).map(lambda x: f't{x}')
+            sns.boxplot(data=group_df_copy, x='t_score_category', y='total_inflam_cells')
+            plt.title('Total Inflammatory Cells Distribution by T-score')
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Total Inflammatory Cells')
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save plot
+            total_cells_corr_path = threshold_dir / "total_cells_correlation_analysis.png"
+            plt.savefig(total_cells_corr_path)
+            plt.savefig(version_dir / "total_cells_correlation_analysis.png")
+            plt.close()
+            
+            self.logger.info(f"Saved total inflammatory cells correlation analysis to {total_cells_corr_path}")
+        
+        # 9. Specific analysis of mean inflammatory cells per tubule vs tubulitis score
+        if 'mean_cells_per_tubule' in group_df.columns:
+            plt.figure(figsize=(12, 10))
+            
+            # Create scatter plot with regression line
+            plt.subplot(2, 1, 1)
+            sns.regplot(
+                data=group_df, 
+                x='tubulitis_score_ground_truth_numeric',
+                y='mean_cells_per_tubule', 
+                scatter_kws={'alpha': 0.7},
+                line_kws={'color': 'red'}
+            )
+            
+            # Calculate correlation
+            try:
+                if len(group_df) >= 2 and group_df['mean_cells_per_tubule'].nunique() > 1:
+                    pearson_r, p_value = pearsonr(
+                        group_df['tubulitis_score_ground_truth_numeric'],
+                        group_df['mean_cells_per_tubule']
+                    )
+                    spearman_r, spearman_p = spearmanr(
+                        group_df['tubulitis_score_ground_truth_numeric'], 
+                        group_df['mean_cells_per_tubule']
+                    )
+                    
+                    plt.title(f'Ground Truth vs Mean Cells/Tubule (prob_thres={prob_thres})\nPearson r={pearson_r:.3f} (p={p_value:.4f}), '
+                             f'Spearman r={spearman_r:.3f} (p={spearman_p:.4f})')
+                else:
+                    plt.title(f'Ground Truth vs Mean Cells/Tubule (prob_thres={prob_thres})\n'
+                             'Not enough data variation for correlation calculation')
+            except Exception as e:
+                self.logger.warning(f"Error calculating correlation for mean_cells_per_tubule: {e}")
+                plt.title(f'Ground Truth vs Mean Cells/Tubule (prob_thres={prob_thres})')
+            
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Mean Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            # Create box plot to show distribution by T-score
+            plt.subplot(2, 1, 2)
+            
+            # Ensure T-score is formatted correctly for the box plot
+            group_df_copy = group_df.copy()
+            group_df_copy['t_score_category'] = group_df_copy['tubulitis_score_ground_truth_numeric'].round().astype(int).map(lambda x: f't{x}')
+            
+            # Create box plot
+            sns.boxplot(data=group_df_copy, x='t_score_category', y='mean_cells_per_tubule')
+            plt.title(f'Distribution of Mean Cells per Tubule by T-score (prob_thres={prob_thres})')
+            plt.xlabel('Ground Truth T-score')
+            plt.ylabel('Mean Cells per Tubule')
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save the plots
+            cells_vs_tscore_path = threshold_dir / "mean_cells_vs_tscore.png"
+            plt.savefig(cells_vs_tscore_path)
+            plt.savefig(version_dir / "mean_cells_vs_tscore.png")
+            
+            # Save the data points for this specific relationship
+            cells_vs_tscore_data = group_df[['wsi_name', 'mean_cells_per_tubule', 
+                                           'tubulitis_score_ground_truth', 
+                                           'tubulitis_score_ground_truth_numeric',
+                                           'tubulitis_score_predicted',
+                                           'prob_thres']]
+            cells_vs_tscore_path_csv = threshold_dir / "mean_cells_vs_tscore.csv"
+            cells_vs_tscore_data.to_csv(cells_vs_tscore_path_csv, index=False)
+            cells_vs_tscore_data.to_csv(version_dir / "mean_cells_vs_tscore.csv", index=False)
+            
+            self.logger.info(f"Saved mean cells per tubule vs T-score analysis to {cells_vs_tscore_path}")
+            plt.close()
+        
+        # 10. Top percentile correlation analysis
+        top_percentile_features = ['mean_cells_top_1pct', 'mean_cells_top_5pct', 'mean_cells_top_10pct']
+        
+        for feature in top_percentile_features:
+            if feature in group_df.columns:
+                plt.figure(figsize=(15, 5))
+                
+                # Extract percentile from feature name for titles
+                pct_name = feature.replace('mean_cells_top_', '').replace('pct', '%')
+                
+                # Subplot 1: Correlation with ground truth T-score
+                plt.subplot(1, 3, 1)
+                sns.regplot(
+                    data=group_df, 
+                    x='tubulitis_score_ground_truth_numeric',
+                    y=feature, 
+                    scatter_kws={'alpha': 0.7, 's': 50},
+                    line_kws={'color': 'red'}
+                )
+                
+                # Calculate correlation
+                try:
+                    if len(group_df) >= 2 and group_df[feature].nunique() > 1:
+                        pearson_r, p_value = pearsonr(
+                            group_df['tubulitis_score_ground_truth_numeric'],
+                            group_df[feature]
+                        )
+                        plt.title(f'Ground Truth vs Top {pct_name} Mean Cells\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                    else:
+                        plt.title(f'Ground Truth vs Top {pct_name} Mean Cells\n(Insufficient data variation)')
+                except Exception as e:
+                    self.logger.warning(f"Error calculating correlation for {feature}: {e}")
+                    plt.title(f'Ground Truth vs Top {pct_name} Mean Cells')
+                
+                plt.xlabel('Ground Truth T-score')
+                plt.ylabel(f'Mean Cells in Top {pct_name} Tubules')
+                plt.grid(True, alpha=0.3)
+                
+                # Subplot 2: Correlation with predicted T-score
+                plt.subplot(1, 3, 2)
+                sns.regplot(
+                    data=group_df, 
+                    x='tubulitis_score_predicted_numeric',
+                    y=feature, 
+                    scatter_kws={'alpha': 0.7, 's': 50},
+                    line_kws={'color': 'green'}
+                )
+                
+                try:
+                    if len(group_df) >= 2 and group_df[feature].nunique() > 1:
+                        pearson_r, p_value = pearsonr(
+                            group_df['tubulitis_score_predicted_numeric'],
+                            group_df[feature]
+                        )
+                        plt.title(f'Predicted vs Top {pct_name} Mean Cells\nPearson r={pearson_r:.3f} (p={p_value:.4f})')
+                    else:
+                        plt.title(f'Predicted vs Top {pct_name} Mean Cells')
+                except Exception as e:
+                    plt.title(f'Predicted vs Top {pct_name} Mean Cells')
+                
+                plt.xlabel('Predicted T-score')
+                plt.ylabel(f'Mean Cells in Top {pct_name} Tubules')
+                plt.grid(True, alpha=0.3)
+                
+                # Subplot 3: Distribution by T-score category
+                plt.subplot(1, 3, 3)
+                group_df_copy = group_df.copy()
+                group_df_copy['t_score_category'] = group_df_copy['tubulitis_score_ground_truth_numeric'].round().astype(int).map(lambda x: f't{x}')
+                sns.boxplot(data=group_df_copy, x='t_score_category', y=feature)
+                plt.title(f'Top {pct_name} Mean Cells Distribution by T-score')
+                plt.xlabel('Ground Truth T-score')
+                plt.ylabel(f'Mean Cells in Top {pct_name} Tubules')
+                plt.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                
+                # Save plot
+                feature_safe_name = feature.replace('_', '')
+                feature_corr_path = threshold_dir / f"{feature_safe_name}_correlation_analysis.png"
+                plt.savefig(feature_corr_path)
+                plt.savefig(version_dir / f"{feature_safe_name}_correlation_analysis.png")
+                plt.close()
+                
+                # Save the data points for this specific relationship
+                feature_data = group_df[['wsi_name', feature, 
+                                       'tubulitis_score_ground_truth', 
+                                       'tubulitis_score_ground_truth_numeric',
+                                       'tubulitis_score_predicted',
+                                       'prob_thres']]
+                feature_data_path = threshold_dir / f"{feature_safe_name}_vs_tscore.csv"
+                feature_data.to_csv(feature_data_path, index=False)
+                feature_data.to_csv(version_dir / f"{feature_safe_name}_vs_tscore.csv", index=False)
+                
+                self.logger.info(f"Saved {feature} correlation analysis to {feature_corr_path}")
+        
+        # 11. Combined top percentiles correlation comparison
+        available_top_features = [f for f in top_percentile_features if f in group_df.columns]
+        
+        if available_top_features and len(group_df) >= 2:
+            plt.figure(figsize=(15, 10))
+            
+            # Create scatter plots for all top percentile features
+            n_features = len(available_top_features)
+            for i, feature in enumerate(available_top_features):
+                pct_name = feature.replace('mean_cells_top_', '').replace('pct', '%')
+                
+                # Top row: vs Ground Truth
+                plt.subplot(2, n_features, i + 1)
+                sns.regplot(
+                    data=group_df, 
+                    x='tubulitis_score_ground_truth_numeric',
+                    y=feature, 
+                    scatter_kws={'alpha': 0.7, 's': 30},
+                    line_kws={'color': 'red'}
+                )
+                
+                try:
+                    if group_df[feature].nunique() > 1:
+                        pearson_r, p_value = pearsonr(
+                            group_df['tubulitis_score_ground_truth_numeric'],
+                            group_df[feature]
+                        )
+                        plt.title(f'Top {pct_name}\nr={pearson_r:.3f} (p={p_value:.3f})')
+                    else:
+                        plt.title(f'Top {pct_name}\n(No variation)')
+                except Exception as e:
+                    plt.title(f'Top {pct_name}')
+                
+                plt.xlabel('Ground Truth T-score')
+                plt.ylabel(f'Mean Cells (Top {pct_name})')
+                plt.grid(True, alpha=0.3)
+                
+                # Bottom row: vs Predicted
+                plt.subplot(2, n_features, i + 1 + n_features)
+                sns.regplot(
+                    data=group_df, 
+                    x='tubulitis_score_predicted_numeric',
+                    y=feature, 
+                    scatter_kws={'alpha': 0.7, 's': 30},
+                    line_kws={'color': 'green'}
+                )
+                
+                try:
+                    if group_df[feature].nunique() > 1:
+                        pearson_r, p_value = pearsonr(
+                            group_df['tubulitis_score_predicted_numeric'],
+                            group_df[feature]
+                        )
+                        plt.title(f'Top {pct_name}\nr={pearson_r:.3f} (p={p_value:.3f})')
+                    else:
+                        plt.title(f'Top {pct_name}\n(No variation)')
+                except Exception as e:
+                    plt.title(f'Top {pct_name}')
+                
+                plt.xlabel('Predicted T-score')
+                plt.ylabel(f'Mean Cells (Top {pct_name})')
+                plt.grid(True, alpha=0.3)
+            
+            plt.suptitle(f'Top Percentile Features Correlation Comparison (prob_thres={prob_thres})', fontsize=14)
+            plt.tight_layout()
+            
+            # Save combined plot
+            combined_top_path = threshold_dir / "top_percentiles_correlation_comparison.png"
+            plt.savefig(combined_top_path)
+            plt.savefig(version_dir / "top_percentiles_correlation_comparison.png")
+            plt.close()
+            
+            self.logger.info(f"Saved combined top percentiles correlation comparison to {combined_top_path}")
+        
+        # 12. Create a README for the threshold-specific version directory
+        from datetime import datetime
+        with open(version_dir / "README.txt", "w") as f:
+            f.write(f"Threshold-specific analysis for prob_thres={prob_thres}\n")
+            f.write(f"Created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Contains results for {len(group_df)} WSIs\n\n")
+            
+            # Show T-score distribution for this threshold
+            if 'tubulitis_score_ground_truth_numeric' in group_df.columns:
+                t_scores = group_df['tubulitis_score_ground_truth_numeric'].round().astype(int).value_counts().sort_index()
+                f.write("Ground truth T-score distribution:\n")
+                for score, count in t_scores.items():
+                    f.write(f"T{int(score)}: {count} samples\n")
+        
+        self.logger.info(f"Created comprehensive visualizations for threshold {prob_thres}")
+
+
+    def _create_threshold_comparison_visualizations(self, metrics_df, eval_df, summary_dir, version_dir):
+        """Create comparison visualizations across all probability thresholds."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import numpy as np
+        from sklearn.metrics import confusion_matrix
+        
+        # 1. Metrics comparison across thresholds
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.flatten()
+        
+        metrics_to_plot = ['accuracy', 'f1_score', 'mae', 'kappa', 'pearson_corr', 'accuracy_within_one']
+        
+        for i, metric in enumerate(metrics_to_plot):
+            if i < len(axes) and metric in metrics_df.columns:
+                axes[i].plot(metrics_df['prob_thres'], metrics_df[metric], 'o-')
+                axes[i].set_title(f'{metric.replace("_", " ").title()}')
+                axes[i].set_xlabel('Probability Threshold')
+                axes[i].grid(alpha=0.3)
+        
+        # Hide unused subplots
+        for i in range(len(metrics_to_plot), len(axes)):
+            axes[i].set_visible(False)
+        
+        plt.tight_layout()
+        
+        comparison_path = summary_dir / "threshold_comparison.png"
+        plt.savefig(comparison_path)
+        plt.savefig(version_dir / "threshold_comparison.png")
+        plt.close()
+        
+        # 2. Error by threshold (boxplot) - parameter effect on prediction error
+        plt.figure(figsize=(8, 6))
+        
+        eval_df['error'] = np.abs(eval_df['tubulitis_score_predicted_numeric'] - eval_df['tubulitis_score_ground_truth_numeric'])
+        sns.boxplot(data=eval_df, x='prob_thres', y='error')
+        plt.title('Error by Probability Threshold')
+        plt.xlabel('Probability Threshold')
+        plt.ylabel('Absolute Error')
+        plt.grid(True, alpha=0.3)
+        
+        error_comparison_path = summary_dir / "parameter_effect_on_error.png"
+        plt.savefig(error_comparison_path)
+        plt.savefig(version_dir / "parameter_effect_on_error.png")
+        plt.close()
+        
+        # 3. Find and visualize best parameter combinations
         if not metrics_df.empty:
             try:
                 best_params = {
@@ -734,74 +1858,64 @@ class KidneyGraderPipeline:
                 
                 # Save best parameters to CSV
                 best_params_df = pd.DataFrame(best_params).T
-                best_params_path = self.summary_dir / "best_parameters.csv"
+                best_params_path = summary_dir / "best_parameters.csv"
                 best_params_df.to_csv(best_params_path)
                 best_params_df.to_csv(version_dir / "best_parameters.csv")
                 self.logger.info(f"Saved best parameters to {best_params_path}")
+                
+                # Create confusion matrix for best accuracy parameters
+                if 'accuracy' in best_params:
+                    best_acc_params = best_params['accuracy']
+                    best_group = eval_df[(eval_df['prob_thres'] == best_acc_params['prob_thres'])]
+                    
+                    if len(best_group) > 0:
+                        plt.figure(figsize=(8, 6))
+                        
+                        y_true = best_group['tubulitis_score_ground_truth_numeric'].round().astype(int)
+                        y_pred = best_group['tubulitis_score_predicted_numeric'].round().astype(int)
+                        
+                        try:
+                            # Check if we have enough unique classes for a meaningful confusion matrix
+                            unique_classes = np.unique(np.concatenate([y_true, y_pred]))
+                            if len(unique_classes) > 1:
+                                cm = confusion_matrix(y_true, y_pred)
+                                
+                                # Normalize confusion matrix
+                                with np.errstate(divide='ignore', invalid='ignore'):
+                                    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+                                    cm_norm = np.nan_to_num(cm_norm, nan=0)  # Replace NaNs with 0
+                                
+                                # Create heatmap
+                                sns.heatmap(cm_norm, annot=cm, fmt='d', cmap='Blues', 
+                                           xticklabels=[f't{i}' for i in range(4)],
+                                           yticklabels=[f't{i}' for i in range(4)])
+                                
+                                plt.title(f'Confusion Matrix (Best Parameters: p={best_acc_params["prob_thres"]})')
+                                plt.xlabel('Predicted T-score')
+                                plt.ylabel('Ground Truth T-score')
+                                
+                                # Save plot
+                                cm_path = summary_dir / "confusion_matrix.png"
+                                plt.savefig(cm_path)
+                                plt.savefig(version_dir / "confusion_matrix.png")
+                            else:
+                                self.logger.warning(f"Not enough unique classes for confusion matrix in best parameter group (p={best_acc_params['prob_thres']})")
+                        except Exception as e:
+                            self.logger.warning(f"Error creating confusion matrix: {e}")
+                        plt.close()
+                    
             except Exception as e:
                 self.logger.warning(f"Error determining best parameters: {e}")
-        else:
-            self.logger.warning("No metrics data available - skipping best parameters calculation")
         
-        # Create correlation analysis between cell counts and ground truth scores
-        if len(eval_df) > 0:
-            correlation_data = []
-            
-            # Features to correlate with ground truth scores
-            features = [
-                'total_inflammatory_tubules', 'total_foci', 'max_cells_in_tubule',
-                'mean_cells_per_tubule', 'total_cells', 'avg_cells_per_focus',
-                'max_cells_in_any_focus'
-            ]
-            
-            # Calculate correlations for each parameter combination
-            for (prob_thres), group in param_groups:
-                for feature in features:
-                    if feature in group.columns:
-                        # Calculate correlations
-                        try:
-                            # Skip if there are fewer than 2 samples or all values are identical
-                            if len(group) < 2 or group[feature].nunique() <= 1 or group['tubulitis_score_ground_truth_numeric'].nunique() <= 1:
-                                self.logger.warning(f"Skipping correlation for feature {feature} in group (p={prob_thres}): insufficient data variation")
-                                continue
-                                
-                            pearson_corr, pearson_p = pearsonr(
-                                group[feature], 
-                                group['tubulitis_score_ground_truth_numeric']
-                            )
-                            spearman_corr, spearman_p = spearmanr(
-                                group[feature], 
-                                group['tubulitis_score_ground_truth_numeric']
-                            )
-                            
-                            correlation_data.append({
-                                'prob_thres': prob_thres,
-                                'feature': feature,
-                                'pearson_corr': pearson_corr,
-                                'pearson_p': pearson_p,
-                                'spearman_corr': spearman_corr,
-                                'spearman_p': spearman_p
-                            })
-                        except Exception as e:
-                            self.logger.warning(f"Could not calculate correlation for {feature} in group (p={prob_thres}): {e}")
-            
-            if correlation_data:
-                correlation_df = pd.DataFrame(correlation_data)
-                correlation_path = self.summary_dir / "feature_correlations.csv"
-                correlation_df.to_csv(correlation_path, index=False)
-                correlation_df.to_csv(version_dir / "feature_correlations.csv", index=False)
-                self.logger.info(f"Saved feature correlations to {correlation_path}")
-        
-        # Create visualizations
-        
-        # 1. Correlation between predicted and ground truth scores
+        # 4. Overall correlation between predicted and ground truth scores across all thresholds
         plt.figure(figsize=(10, 8))
         
         # Create a jittered scatter plot with different markers for different parameter combinations
         markers = ['o', 's', 'D', '^', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x', 'd']
         colors = plt.cm.tab10.colors
         
-        for i, ((prob_thres), group) in enumerate(param_groups):
+        param_groups = eval_df.groupby('prob_thres')
+        for i, (prob_thres, group) in enumerate(param_groups):
             marker = markers[i % len(markers)]
             color = colors[i % len(colors)]
             
@@ -825,6 +1939,7 @@ class KidneyGraderPipeline:
         # Calculate overall correlation
         try:
             if len(x) >= 2 and x.nunique() > 1 and y.nunique() > 1:
+                from scipy.stats import pearsonr
                 pearson_corr, _ = pearsonr(x, y)
                 corr_text = f'Pearson r={pearson_corr:.2f}'
             else:
@@ -844,269 +1959,12 @@ class KidneyGraderPipeline:
         plt.tight_layout()
         
         # Save plot
-        pred_vs_truth_path = self.summary_dir / "predicted_vs_ground_truth.png"
+        pred_vs_truth_path = summary_dir / "predicted_vs_ground_truth.png"
         plt.savefig(pred_vs_truth_path)
         plt.savefig(version_dir / "predicted_vs_ground_truth.png")
         plt.close()
         
-        # 2. Feature importance plot - correlation of features with ground truth
-        if 'correlation_df' in locals():
-            plt.figure(figsize=(12, 8))
-            
-            # Filter to significant correlations
-            sig_correlations = correlation_df[correlation_df['pearson_p'] < 0.05]
-            
-            if not sig_correlations.empty:
-                try:
-                    # Pivot to get features as rows and parameters as columns
-                    pivot_df = sig_correlations.pivot_table(
-                        index='feature',
-                        columns=['prob_thres'],
-                        values='pearson_corr'
-                    )
-                    
-                    if not pivot_df.empty:
-                        # Plot heatmap
-                        sns.heatmap(pivot_df, annot=True, cmap='coolwarm', center=0, fmt='.2f')
-                        plt.title('Feature Correlation with Ground Truth T-score')
-                        plt.tight_layout()
-                        
-                        # Save plot
-                        feature_corr_path = self.summary_dir / "feature_correlations.png"
-                        plt.savefig(feature_corr_path)
-                        plt.savefig(version_dir / "feature_correlations.png")
-                    else:
-                        self.logger.warning("Feature correlation pivot table is empty - skipping heatmap")
-                except Exception as e:
-                    self.logger.warning(f"Error creating feature correlation heatmap: {e}")
-                plt.close()
-            else:
-                self.logger.warning("No significant correlations found - skipping feature correlation heatmap")
-                plt.close()
-        
-        # 3. Parameter effect on prediction error
-        plt.figure(figsize=(12, 6))
-        
-        # Calculate error for each sample
-        eval_df['error'] = np.abs(eval_df['tubulitis_score_predicted_numeric'] - eval_df['tubulitis_score_ground_truth_numeric'])
-        
-        # Plot error by probability threshold
-        plt.subplot(1, 2, 1)
-        sns.boxplot(data=eval_df, x='prob_thres', y='error')
-        plt.title('Error by Probability Threshold')
-        plt.xlabel('Probability Threshold')
-        plt.ylabel('Absolute Error')
-        plt.grid(True, alpha=0.3)
-        
-        # Plot error by foci distance
-        plt.subplot(1, 2, 2)
-        sns.boxplot(data=eval_df, x='foci_dist', y='error')
-        plt.title('Error by Foci Distance')
-        plt.xlabel('Foci Distance')
-        plt.ylabel('Absolute Error')
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save plot
-        param_effect_path = self.summary_dir / "parameter_effect_on_error.png"
-        plt.savefig(param_effect_path)
-        plt.savefig(version_dir / "parameter_effect_on_error.png")
-        plt.close()
-        
-        # 4. Confusion matrix for best parameters
-        if best_params and 'accuracy' in best_params:
-            best_acc_params = best_params['accuracy']
-            best_group = eval_df[(eval_df['prob_thres'] == best_acc_params['prob_thres'])]
-            
-            if len(best_group) > 0:
-                plt.figure(figsize=(8, 6))
-                
-                y_true = best_group['tubulitis_score_ground_truth_numeric'].round().astype(int)
-                y_pred = best_group['tubulitis_score_predicted_numeric'].round().astype(int)
-                
-                try:
-                    # Check if we have enough unique classes for a meaningful confusion matrix
-                    unique_classes = np.unique(np.concatenate([y_true, y_pred]))
-                    if len(unique_classes) > 1:
-                        cm = confusion_matrix(y_true, y_pred)
-                        
-                        # Normalize confusion matrix
-                        with np.errstate(divide='ignore', invalid='ignore'):
-                            cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-                            cm_norm = np.nan_to_num(cm_norm, nan=0)  # Replace NaNs with 0
-                        
-                        # Create heatmap
-                        sns.heatmap(cm_norm, annot=cm, fmt='d', cmap='Blues', 
-                                   xticklabels=[f't{i}' for i in range(4)],
-                                   yticklabels=[f't{i}' for i in range(4)])
-                        
-                        plt.title(f'Confusion Matrix (Best Parameters: p={best_acc_params["prob_thres"]})')
-                        plt.xlabel('Predicted T-score')
-                        plt.ylabel('Ground Truth T-score')
-                        
-                        # Save plot
-                        cm_path = self.summary_dir / "confusion_matrix.png"
-                        plt.savefig(cm_path)
-                        plt.savefig(version_dir / "confusion_matrix.png")
-                    else:
-                        self.logger.warning(f"Not enough unique classes for confusion matrix in best parameter group (p={best_acc_params['prob_thres']})")
-                except Exception as e:
-                    self.logger.warning(f"Error creating confusion matrix: {e}")
-                plt.close()
-        else:
-            self.logger.warning("No best parameters available - skipping confusion matrix")
-        
-        # 5. Feature correlation with prediction error
-        plt.figure(figsize=(10, 8))
-        
-        # Calculate correlations between features and error
-        error_corr_data = []
-        
-        for feature in features:
-            if feature in eval_df.columns:
-                try:
-                    # Skip if there are fewer than 2 samples or all values are identical
-                    if len(eval_df) < 2 or eval_df[feature].nunique() <= 1 or eval_df['error'].nunique() <= 1:
-                        self.logger.warning(f"Skipping error correlation for feature {feature}: insufficient data variation")
-                        continue
-                        
-                    pearson_corr, pearson_p = pearsonr(eval_df[feature], eval_df['error'])
-                    error_corr_data.append({
-                        'feature': feature,
-                        'correlation': pearson_corr,
-                        'p_value': pearson_p
-                    })
-                except Exception as e:
-                    self.logger.warning(f"Could not calculate error correlation for {feature}: {e}")
-        
-        if error_corr_data:
-            try:
-                error_corr_df = pd.DataFrame(error_corr_data)
-                error_corr_df = error_corr_df.sort_values('correlation', ascending=False)
-                
-                # Create bar plot
-                plt.barh(error_corr_df['feature'], error_corr_df['correlation'])
-                plt.axvline(x=0, color='k', linestyle='--', alpha=0.3)
-                plt.title('Feature Correlation with Prediction Error')
-                plt.xlabel('Pearson Correlation')
-                plt.grid(alpha=0.3)
-                plt.tight_layout()
-                
-                # Save plot
-                error_corr_path = self.summary_dir / "error_correlations.png"
-                plt.savefig(error_corr_path)
-                plt.savefig(version_dir / "error_correlations.png")
-                
-                # Save to CSV
-                error_corr_df.to_csv(self.summary_dir / "error_correlations.csv", index=False)
-                error_corr_df.to_csv(version_dir / "error_correlations.csv", index=False)
-            except Exception as e:
-                self.logger.warning(f"Error creating error correlation visualization: {e}")
-        else:
-            self.logger.warning("No valid error correlations found - skipping error correlation visualization")
-        
-        plt.close()
-        
-        # 6. Specific analysis of mean inflammatory cells per tubule vs tubulitis score
-        if 'mean_cells_per_tubule' in eval_df.columns:
-            plt.figure(figsize=(12, 10))
-            
-            # Create scatter plot with regression line
-            plt.subplot(2, 1, 1)
-            sns.regplot(
-                data=eval_df, 
-                x='mean_cells_per_tubule', 
-                y='tubulitis_score_ground_truth_numeric',
-                scatter_kws={'alpha': 0.7},
-                line_kws={'color': 'red'}
-            )
-            
-            # Calculate correlation
-            try:
-                if len(eval_df) >= 2 and eval_df['mean_cells_per_tubule'].nunique() > 1:
-                    pearson_r, p_value = pearsonr(
-                        eval_df['mean_cells_per_tubule'], 
-                        eval_df['tubulitis_score_ground_truth_numeric']
-                    )
-                    spearman_r, spearman_p = spearmanr(
-                        eval_df['mean_cells_per_tubule'], 
-                        eval_df['tubulitis_score_ground_truth_numeric']
-                    )
-                    
-                    plt.title(f'Mean Cells per Tubule vs Ground Truth T-score\n'
-                             f'Pearson r={pearson_r:.3f} (p={p_value:.4f}), '
-                             f'Spearman r={spearman_r:.3f} (p={spearman_p:.4f})')
-                else:
-                    plt.title('Mean Cells per Tubule vs Ground Truth T-score\n'
-                             'Not enough data variation for correlation calculation')
-            except Exception as e:
-                self.logger.warning(f"Error calculating correlation for mean_cells_per_tubule: {e}")
-                plt.title('Mean Cells per Tubule vs Ground Truth T-score')
-            
-            plt.xlabel('Mean Inflammatory Cells per Tubule')
-            plt.ylabel('Ground Truth T-score')
-            plt.grid(True, alpha=0.3)
-            
-            # Create box plot to show distribution by T-score
-            plt.subplot(2, 1, 2)
-            
-            # Ensure T-score is formatted correctly for the box plot
-            eval_df['t_score_category'] = eval_df['tubulitis_score_ground_truth_numeric'].round().astype(int).map(lambda x: f't{x}')
-            
-            # Create box plot
-            sns.boxplot(data=eval_df, x='t_score_category', y='mean_cells_per_tubule')
-            plt.title('Distribution of Mean Cells per Tubule by T-score')
-            plt.xlabel('T-score')
-            plt.ylabel('Mean Inflammatory Cells per Tubule')
-            plt.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            # Save the plots
-            cells_vs_tscore_path = self.summary_dir / "mean_cells_vs_tscore.png"
-            plt.savefig(cells_vs_tscore_path)
-            plt.savefig(version_dir / "mean_cells_vs_tscore.png")
-            
-            # Save the data points for this specific relationship
-            cells_vs_tscore_data = eval_df[['wsi_name', 'mean_cells_per_tubule', 
-                                           'tubulitis_score_ground_truth', 
-                                           'tubulitis_score_ground_truth_numeric',
-                                           'tubulitis_score_predicted',
-                                           'prob_thres']]
-            cells_vs_tscore_path_csv = self.summary_dir / "mean_cells_vs_tscore.csv"
-            cells_vs_tscore_data.to_csv(cells_vs_tscore_path_csv, index=False)
-            cells_vs_tscore_data.to_csv(version_dir / "mean_cells_vs_tscore.csv", index=False)
-            
-            self.logger.info(f"Saved mean cells per tubule vs T-score analysis to {cells_vs_tscore_path}")
-        else:
-            self.logger.warning("No 'mean_cells_per_tubule' feature available - skipping specific analysis")
-        
-        plt.close()
-        
-        # Create a README for the version directory
-        with open(version_dir / "README.txt", "w") as f:
-            f.write(f"Summary analysis created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Contains results for {len(results_df)} WSIs across {len(param_groups)} parameter combinations\n")
-            f.write(f"Evaluation performed on {len(eval_df)} WSIs with ground truth data\n\n")
-            
-            if best_params:
-                f.write("Best parameter combinations:\n")
-                for metric, params in best_params.items():
-                    f.write(f"- Best for {metric}: prob_thres={params['prob_thres']} ")
-                    f.write(f"(value: {params[metric]:.4f}, samples: {params['sample_count']})\n")
-            else:
-                f.write("No best parameter combinations determined due to insufficient data\n")
-            
-            # Show T-score distribution
-            if 'tubulitis_score_ground_truth_numeric' in eval_df.columns:
-                t_scores = eval_df['tubulitis_score_ground_truth_numeric'].round().astype(int).value_counts().sort_index()
-                f.write("\nGround truth T-score distribution:\n")
-                for score, count in t_scores.items():
-                    f.write(f"T{int(score)}: {count} samples\n")
-        
-        self.logger.info(f"Updated summary files in {self.summary_dir}")
-        self.logger.info(f"Created versioned summary in {version_dir}")
+        self.logger.info("Created threshold comparison visualizations")
 
     def run_by_stage(self, wsi_path: str, stage: str, force: bool = False, visualise: bool = False, update_summary: bool = False) -> Dict[str, Any]:
         # Handle comma-separated stages (e.g., "3,4")

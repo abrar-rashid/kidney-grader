@@ -1,16 +1,11 @@
 from pathlib import Path
 import subprocess
 import json
-import cv2
-from tiffslide import TiffSlide
-
 import numpy as np
 
 from detection.patch_extractor import extract_patches_from_wsi
 
-def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path: str, visualise: bool = False) -> np.ndarray:
-    MICRONS_PER_PIXEL = 0.24199951445730394
-
+def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path: str) -> np.ndarray:
     patches = extract_patches_from_wsi(
         wsi_path=wsi_path,
         patch_size=2048,
@@ -56,32 +51,5 @@ def run_inflammatory_cell_detection(wsi_path: str, output_dir: Path, model_path:
         inflammatory_cells = json.load(f)
 
     coords = np.array([[p["point"][0], p["point"][1]] for p in inflammatory_cells["points"]])
-
-    if visualise:
-        slide = TiffSlide(wsi_path)
-
-        # downsample factor of 5x is the highest resolution that qupath can handle
-        level = slide.get_best_level_for_downsample(5)
-        thumb = slide.read_region((0, 0), level, slide.level_dimensions[level], as_array=True)
-
-        scale_x = slide.level_dimensions[0][0] / thumb.shape[1]
-        scale_y = slide.level_dimensions[0][1] / thumb.shape[0]
-
-        overlay = thumb.copy()
-
-        for x, y in coords:
-            x_ds, y_ds = int(x / scale_x), int(y / scale_y)
-            if 0 <= x_ds < overlay.shape[1] and 0 <= y_ds < overlay.shape[0]:
-                cv2.circle(overlay, (x_ds, y_ds), 3, (0, 255, 255), -1)
-
-        # save as PNG
-        output_image_path_png = output_dir / "inflammatory_cells_overlay_downsampled.png"
-        cv2.imwrite(str(output_image_path_png), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-        print(f"Overlay saved as PNG at: {output_image_path_png}")
-
-        # save as TIFF
-        output_image_path_tiff = output_dir / "inflammatory_cells_overlay_downsampled.tiff"
-        cv2.imwrite(str(output_image_path_tiff), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-        print(f"Overlay saved as TIFF at: {output_image_path_tiff}")
 
     return coords

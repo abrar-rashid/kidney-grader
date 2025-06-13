@@ -75,32 +75,58 @@ def run_single_wsi(wsi_path: Path, output_dir: Path, **kwargs) -> dict:
         cmd.extend(["--instance_mask_class1", kwargs["instance_mask_class1"]])
     
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=kwargs.get("timeout", 10800)
-        )
-        
-        duration = time.time() - start_time
-        
-        if result.returncode == 0:
-            return {
-                "wsi_name": wsi_name,
-                "status": "success",
-                "duration": duration,
-                "stdout": result.stdout,
-                "stderr": result.stderr
-            }
+        if kwargs.get("verbose"):
+            result = subprocess.run(
+                cmd,
+                text=True,
+                timeout=kwargs.get("timeout", 10800)
+            )
+            duration = time.time() - start_time
+            
+            if result.returncode == 0:
+                return {
+                    "wsi_name": wsi_name,
+                    "status": "success",
+                    "duration": duration,
+                    "stdout": "",
+                    "stderr": ""
+                }
+            else:
+                return {
+                    "wsi_name": wsi_name,
+                    "status": "failed",
+                    "duration": duration,
+                    "stdout": "",
+                    "stderr": f"Process failed with return code {result.returncode}",
+                    "returncode": result.returncode
+                }
         else:
-            return {
-                "wsi_name": wsi_name,
-                "status": "failed",
-                "duration": duration,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=kwargs.get("timeout", 10800)
+            )
+            
+            duration = time.time() - start_time
+            
+            if result.returncode == 0:
+                return {
+                    "wsi_name": wsi_name,
+                    "status": "success",
+                    "duration": duration,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+            else:
+                return {
+                    "wsi_name": wsi_name,
+                    "status": "failed",
+                    "duration": duration,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "returncode": result.returncode
+                }
             
     except subprocess.TimeoutExpired:
         return {
@@ -229,10 +255,11 @@ def main():
     parser.add_argument("--max_workers", type=int, default=1,
                        help="Number of parallel workers (default: 1 for sequential)")
     parser.add_argument("--timeout", type=int, default=10800,
-                       help="Timeout per WSI in seconds (default: 10800 seconds = 3 hours)")
+                       help="Timeout per WSI in seconds (default: 10800)")
     
     parser.add_argument("--pattern", help="Only process files matching this pattern (e.g., '*case1*')")
     parser.add_argument("--limit", type=int, help="Limit number of files to process (for testing)")
+    parser.add_argument("--verbose", action="store_true", help="Show real-time output from each WSI processing")
     
     args = parser.parse_args()
     
@@ -275,7 +302,8 @@ def main():
         "detection_json": args.detection_json,
         "instance_mask_class1": args.instance_mask_class1,
         "precomputed_detections_dir": args.precomputed_detections_dir,
-        "timeout": args.timeout
+        "timeout": args.timeout,
+        "verbose": args.verbose
     }
     
     start_time = time.time()

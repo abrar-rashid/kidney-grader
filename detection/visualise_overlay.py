@@ -44,7 +44,7 @@ def generate_tiff_overlay(coords, wsi_path, output_path):
     for x, y in pixel_coords:
         x_ds, y_ds = int(x / scale_x), int(y / scale_y)
         if 0 <= x_ds < overlay.shape[1] and 0 <= y_ds < overlay.shape[0]:
-            cv2.circle(overlay, (x_ds, y_ds), 5, (0, 255, 255), 1)  # dots
+            cv2.circle(overlay, (x_ds, y_ds), 5, (255, 255, 0), 1)
 
     # Save the result as a TIFF file
     output_path_tiff = str(output_path).replace(".tiff", "_overlay.tiff")

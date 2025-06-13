@@ -1,8 +1,8 @@
-from huggingface_hub import hf_hub_download
-import os
 import shutil
+import os
+from huggingface_hub import hf_hub_download
 
-REPO_ID = "ar2221/KidneyGrader"
+REPO_ID = "a-rashid/KidneyGrader"
 
 CHECKPOINTS = {
     "checkpoints/detection/1949389_2.pt": "checkpoints/detection",
@@ -19,16 +19,19 @@ def main():
         print(f"Downloading {filename} into {local_dir}...")
         os.makedirs(local_dir, exist_ok=True)
 
-        # Download to temp location
+        # Download file (read-only in Hugging Face cache)
         downloaded_path = hf_hub_download(
             repo_id=REPO_ID,
-            filename=remote_path,
+            filename=remote_path
         )
 
-        # Move file into correct local directory
         target_path = os.path.join(local_dir, filename)
-        shutil.move(downloaded_path, target_path)
-    print("All checkpoints downloaded.")
+
+        # Copy instead of move to avoid cross-device errors
+        shutil.copy2(downloaded_path, target_path)
+        print(f"✔ Copied to {target_path}")
+
+    print("All checkpoints downloaded and copied.")
 
 if __name__ == "__main__":
     main()

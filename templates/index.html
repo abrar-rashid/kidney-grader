@@ -1,0 +1,549 @@
+<!-- Credit to Claude 4o for frontend ui code -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KidneyGrader: The First Automated Tubulitis Scorer!</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --clinical-blue: #2563eb;
+            --clinical-teal: #0891b2;
+            --clinical-green: #059669;
+            --clinical-navy: #1e40af;
+            --clinical-light-blue: #dbeafe;
+            --clinical-background: #f8fafc;
+            --clinical-accent: #0369a1;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, var(--clinical-background) 0%, #f1f5f9 100%);
+        }
+
+        .drop-zone {
+            border: 2px dashed var(--clinical-teal);
+            transition: all 0.3s ease;
+            background: rgba(8, 145, 178, 0.05);
+        }
+        
+        .drop-zone:hover {
+            border-color: var(--clinical-blue);
+            background: rgba(37, 99, 235, 0.1);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(37, 99, 235, 0.15);
+        }
+
+        .loading {
+            display: none;
+        }
+        
+        .loading.active {
+            display: flex;
+        }
+
+        .clinical-gradient {
+            background: linear-gradient(135deg, var(--clinical-blue) 0%, var(--clinical-teal) 100%);
+        }
+
+        .clinical-text-gradient {
+            background: linear-gradient(135deg, var(--clinical-navy) 0%, var(--clinical-accent) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .card-shadow {
+            box-shadow: 0 10px 35px rgba(37, 99, 235, 0.1);
+        }
+
+        .btn-clinical {
+            background: linear-gradient(135deg, var(--clinical-blue) 0%, var(--clinical-teal) 100%);
+            transition: all 0.3s ease;
+        }
+
+        .btn-clinical:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(37, 99, 235, 0.3);
+        }
+
+        .btn-clinical:disabled {
+            background: #d1d5db;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .tab-active {
+            background: linear-gradient(135deg, var(--clinical-blue) 0%, var(--clinical-teal) 100%);
+            color: white;
+            border-color: var(--clinical-blue);
+        }
+
+        .tab-inactive {
+            color: var(--clinical-navy);
+            border-color: transparent;
+        }
+
+        .tab-inactive:hover {
+            color: var(--clinical-blue);
+            background: var(--clinical-light-blue);
+        }
+
+        .select-clinical {
+            border-color: var(--clinical-teal);
+        }
+
+        .select-clinical:focus {
+            outline: none;
+            border-color: var(--clinical-blue);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .score-display {
+            background: linear-gradient(135deg, var(--clinical-blue) 0%, var(--clinical-teal) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: 0 2px 4px rgba(37, 99, 235, 0.2);
+        }
+
+        .clinical-pattern {
+            background-image: radial-gradient(circle at 1px 1px, rgba(37, 99, 235, 0.05) 1px, transparent 0);
+            background-size: 20px 20px;
+        }
+
+        .stain-indicator {
+            background: linear-gradient(90deg, var(--clinical-blue) 0%, var(--clinical-teal) 50%, var(--clinical-green) 100%);
+            height: 4px;
+            border-radius: 2px;
+        }
+
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 34px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            -webkit-transition: .4s;
+            transition: .4s;
+            border-radius: 34px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 26px;
+            width: 26px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            -webkit-transition: .4s;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background: linear-gradient(135deg, var(--clinical-blue) 0%, var(--clinical-teal) 100%);
+        }
+
+        input:checked + .slider:before {
+            -webkit-transform: translateX(26px);
+            -ms-transform: translateX(26px);
+            transform: translateX(26px);
+        }
+    </style>
+</head>
+<body class="min-h-screen clinical-pattern">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <header class="text-center mb-12">
+            <div class="stain-indicator w-32 mx-auto mb-6"></div>
+            <h1 class="text-5xl font-bold clinical-text-gradient mb-3">KidneyGrader: The First Automated Tubulitis Scorer!</h1>
+            <h2 class="text-xl font-medium text-blue-700 mb-2">Clinical Analysis System</h2>
+            <p class="text-lg text-blue-600">Upload a whole slide image or select from available slides to analyse tubulitis severity</p>
+            <div class="mt-4 text-sm text-blue-500">
+                🔬 Automated Banff Classification for Kidney Biopsies
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="max-w-4xl mx-auto">
+            <!-- Tab Navigation -->
+            <div class="bg-white/80 backdrop-blur-sm rounded-lg card-shadow mb-8 border border-blue-200">
+                <div class="border-b border-blue-200">
+                    <nav class="-mb-px flex space-x-8 px-6 pt-4">
+                        <button id="select-tab" class="tab-inactive whitespace-nowrap py-3 px-4 border-b-2 font-medium text-sm rounded-t-lg transition-all duration-300">
+                            📁 Select from Host
+                        </button>
+                        <button id="upload-tab" class="tab-active whitespace-nowrap py-3 px-4 border-b-2 font-medium text-sm rounded-t-lg transition-all duration-300">
+                            📤 Upload File
+                        </button>
+                    </nav>
+                </div>
+
+                <!-- Select from Host Section -->
+                <div id="select-section" class="p-6 hidden">
+                    <h3 class="text-lg font-medium text-blue-800 mb-4">🔍 Select a slide from the host directory:</h3>
+                    
+                    <div class="space-y-4">
+                        <div class="flex space-x-4">
+                            <div class="flex-1">
+                                <label for="wsi-set-select" class="block text-sm font-medium text-blue-700 mb-2">WSI Collection:</label>
+                                <select id="wsi-set-select" class="block w-full px-4 py-3 border-2 select-clinical rounded-lg shadow-sm focus:outline-none transition-all duration-300">
+                                    <option value="">Select a WSI collection...</option>
+                                    {% for wsi_set in available_slides.keys() %}
+                                    <option value="{{ wsi_set }}">{{ wsi_set }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="flex-1">
+                                <label for="slide-select" class="block text-sm font-medium text-blue-700 mb-2">Slide:</label>
+                                <select id="slide-select" class="block w-full px-4 py-3 border-2 select-clinical rounded-lg shadow-sm focus:outline-none transition-all duration-300" disabled>
+                                    <option value="">Select a slide...</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Visualization Toggle -->
+                        <div class="flex items-center justify-between bg-blue-50 rounded-lg p-4 border border-blue-200">
+                            <div>
+                                <label class="text-sm font-medium text-blue-800">Generate Attention Visualizations</label>
+                                <p class="text-xs text-blue-600">Enable to see heatmaps showing model attention (increases processing time)</p>
+                            </div>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="enable-viz-select" checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        
+                        <button id="process-slide-btn" class="w-full btn-clinical text-white py-3 px-6 rounded-lg font-medium shadow-lg disabled:bg-gray-400 disabled:cursor-not-allowed transition-all duration-300" disabled>
+                            🔬 Analyse Selected Slide
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Upload Section -->
+                <div id="upload-section" class="p-6">
+                    <!-- Visualization Toggle for Upload -->
+                    <div class="flex items-center justify-between bg-blue-50 rounded-lg p-4 border border-blue-200 mb-6">
+                        <div>
+                            <label class="text-sm font-medium text-blue-800">Generate Attention Visualizations</label>
+                            <p class="text-xs text-blue-600">Enable to see heatmaps showing model attention (increases processing time)</p>
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="enable-viz-upload" checked>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+
+                    <div id="drop-zone" class="drop-zone rounded-xl p-10 text-center cursor-pointer transition-all duration-300">
+                        <div class="space-y-6">
+                            <div class="w-16 h-16 mx-auto bg-gradient-to-br from-blue-400 to-teal-500 rounded-full flex items-center justify-center text-white text-2xl">
+                                🔬
+                            </div>
+                            <div class="text-blue-700">
+                                <p class="text-xl font-semibold mb-2">Drag and drop your whole slide image here</p>
+                                <p class="text-sm">or click to browse files</p>
+                            </div>
+                            <div class="text-xs text-blue-500 bg-blue-50 rounded-lg p-3">
+                                Supported formats: .svs, .ndpi, .tif, .tiff<br>
+                                <em>Optimized for kidney biopsy tissue sections</em>
+                            </div>
+                        </div>
+                        <input type="file" id="file-input" class="hidden" accept=".svs,.ndpi,.tif,.tiff">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Loading Indicator -->
+            <div id="loading" class="loading items-center justify-center space-x-3 mb-8">
+                <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-500"></div>
+                <p class="text-blue-700 font-medium">🔬 Processing tissue analysis...</p>
+            </div>
+
+            <!-- Results Section -->
+            <div id="results" class="bg-white/80 backdrop-blur-sm rounded-xl card-shadow p-8 hidden border border-blue-200">
+                <h2 class="text-3xl font-bold clinical-text-gradient mb-6">📊 Clinical Analysis Results</h2>
+                
+                <!-- Prediction Score -->
+                <div class="mb-8 bg-gradient-to-r from-blue-50 to-teal-50 rounded-xl p-6 border border-blue-200">
+                    <h3 class="text-xl font-semibold text-blue-800 mb-3">🎯 Tubulitis Score</h3>
+                    <div class="flex items-center space-x-6">
+                        <div id="score" class="text-6xl font-bold score-display">-</div>
+                        <div class="flex-1">
+                            <div class="text-sm text-blue-600 mb-2">(0-3 Banff Classification Scale)</div>
+                            <div class="text-xs text-blue-500">
+                                0 = No tubulitis | 1 = 1-4 cells/tubule | 2 = 5-10 cells/tubule | 3 = >10 cells/tubule
+                            </div>
+                        </div>
+                    </div>
+                    <div id="slide-name" class="text-sm text-blue-600 mt-4 font-medium"></div>
+                </div>
+
+                <!-- Visualizations -->
+                <div id="viz-section" class="space-y-6">
+                    <h3 class="text-xl font-semibold text-blue-800 mb-4">🎨 Attention Heatmaps</h3>
+                    <div class="text-sm text-blue-600 mb-4 bg-blue-50 rounded-lg p-3">
+                        <strong>Attention maps</strong> highlight regions where the AI model focused during analysis. 
+                        Brighter areas indicate higher attention weights, typically corresponding to tubular inflammation patterns.
+                    </div>
+                    <div id="visualizations" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <!-- Visualization images will be inserted here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Error Message -->
+            <div id="error" class="hidden bg-red-50 border-2 border-red-200 rounded-xl p-6 mb-8">
+                <div class="flex">
+                    <div class="flex-shrink-0">
+                        <div class="w-6 h-6 bg-red-400 rounded-full flex items-center justify-center text-white text-sm">⚠</div>
+                    </div>
+                    <div class="ml-4">
+                        <h3 class="text-lg font-medium text-red-800 mb-1">Analysis Error</h3>
+                        <p id="error-message" class="text-sm text-red-700"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Available slides data from Flask template
+        const availableSlides = JSON.parse('{{ available_slides | tojson | safe }}');
+        
+        // Elements
+        const selectTab = document.getElementById('select-tab');
+        const uploadTab = document.getElementById('upload-tab');
+        const selectSection = document.getElementById('select-section');
+        const uploadSection = document.getElementById('upload-section');
+        const wsiSetSelect = document.getElementById('wsi-set-select');
+        const slideSelect = document.getElementById('slide-select');
+        const processSlideBtn = document.getElementById('process-slide-btn');
+        const enableVizSelect = document.getElementById('enable-viz-select');
+        const enableVizUpload = document.getElementById('enable-viz-upload');
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const loading = document.getElementById('loading');
+        const results = document.getElementById('results');
+        const score = document.getElementById('score');
+        const slideName = document.getElementById('slide-name');
+        const vizSection = document.getElementById('viz-section');
+        const visualizations = document.getElementById('visualizations');
+        const error = document.getElementById('error');
+        const errorMessage = document.getElementById('error-message');
+
+        // Tab switching
+        selectTab.addEventListener('click', () => {
+            selectTab.className = 'tab-active whitespace-nowrap py-3 px-4 border-b-2 font-medium text-sm rounded-t-lg transition-all duration-300';
+            uploadTab.className = 'tab-inactive whitespace-nowrap py-3 px-4 border-b-2 font-medium text-sm rounded-t-lg transition-all duration-300';
+            selectSection.classList.remove('hidden');
+            uploadSection.classList.add('hidden');
+        });
+
+        uploadTab.addEventListener('click', () => {
+            uploadTab.className = 'tab-active whitespace-nowrap py-3 px-4 border-b-2 font-medium text-sm rounded-t-lg transition-all duration-300';
+            selectTab.className = 'tab-inactive whitespace-nowrap py-3 px-4 border-b-2 font-medium text-sm rounded-t-lg transition-all duration-300';
+            uploadSection.classList.remove('hidden');
+            selectSection.classList.add('hidden');
+        });
+
+        // WSI set selection
+        wsiSetSelect.addEventListener('change', (e) => {
+            const selectedSet = e.target.value;
+            slideSelect.innerHTML = '<option value="">Select a slide...</option>';
+            
+            if (selectedSet && availableSlides[selectedSet]) {
+                slideSelect.disabled = false;
+                availableSlides[selectedSet].forEach(slide => {
+                    const option = document.createElement('option');
+                    option.value = slide;
+                    option.textContent = slide;
+                    slideSelect.appendChild(option);
+                });
+            } else {
+                slideSelect.disabled = true;
+                processSlideBtn.disabled = true;
+            }
+        });
+
+        // Slide selection
+        slideSelect.addEventListener('change', (e) => {
+            processSlideBtn.disabled = !e.target.value;
+        });
+
+        // Process selected slide
+        processSlideBtn.addEventListener('click', () => {
+            const selectedSet = wsiSetSelect.value;
+            const selectedSlide = slideSelect.value;
+            const enableViz = enableVizSelect.checked;
+            
+            if (!selectedSet || !selectedSlide) return;
+            
+            const slidePath = `/data/ar2221/all_wsis/${selectedSet}/${selectedSlide}`;
+            processSlide(slidePath, enableViz);
+        });
+
+        // Handle drag and drop for upload
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.style.borderColor = 'var(--clinical-blue)';
+            dropZone.style.background = 'rgba(37, 99, 235, 0.1)';
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.style.borderColor = 'var(--clinical-teal)';
+            dropZone.style.background = 'rgba(8, 145, 178, 0.05)';
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.style.borderColor = 'var(--clinical-teal)';
+            dropZone.style.background = 'rgba(8, 145, 178, 0.05)';
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                const enableViz = enableVizUpload.checked;
+                handleFileUpload(files[0], enableViz);
+            }
+        });
+
+        // Handle click to upload
+        dropZone.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                const enableViz = enableVizUpload.checked;
+                handleFileUpload(e.target.files[0], enableViz);
+            }
+        });
+
+        function processSlide(slidePath, enableViz = true) {
+            // Reset UI
+            error.classList.add('hidden');
+            results.classList.add('hidden');
+            loading.classList.add('active');
+            
+            fetch('/process_slide', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ 
+                    slide_path: slidePath,
+                    enable_visualizations: enableViz
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                loading.classList.remove('active');
+                handleResults(data, enableViz);
+            })
+            .catch(err => {
+                loading.classList.remove('active');
+                showError('An error occurred while processing the slide.');
+                console.error('Error:', err);
+            });
+        }
+
+        function handleFileUpload(file, enableViz = true) {
+            // Reset UI
+            error.classList.add('hidden');
+            results.classList.add('hidden');
+            loading.classList.add('active');
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('enable_visualizations', enableViz);
+
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                loading.classList.remove('active');
+                handleResults(data, enableViz);
+            })
+            .catch(err => {
+                loading.classList.remove('active');
+                showError('An error occurred while processing the uploaded image.');
+                console.error('Error:', err);
+            });
+        }
+
+        function handleResults(data, enableViz) {
+            if (data.error) {
+                showError(data.error);
+                return;
+            }
+
+            // Update score and slide name
+            score.textContent = data.prediction.toFixed(2);
+            slideName.textContent = `📋 Slide: ${data.slide_name}`;
+            
+            // Handle visualizations based on toggle
+            if (enableViz && data.visualization_files && data.visualization_files.length > 0) {
+                vizSection.classList.remove('hidden');
+                
+                // Clear previous visualizations
+                visualizations.innerHTML = '';
+                
+                // Add visualization images
+                data.visualization_files.forEach(vizPath => {
+                    const imgContainer = document.createElement('div');
+                    imgContainer.className = 'bg-gradient-to-br from-blue-50 to-teal-50 rounded-xl p-4 border border-blue-200 transition-all duration-300 hover:shadow-lg';
+                    
+                    const img = document.createElement('img');
+                    img.src = vizPath;
+                    img.className = 'w-full h-auto rounded-lg border border-blue-200';
+                    img.alt = 'Attention map visualization';
+                    
+                    const caption = document.createElement('p');
+                    caption.className = 'text-sm text-blue-700 mt-3 text-center font-medium';
+                    caption.textContent = `🎨 ${vizPath.split('/').pop().replace('.png', '')}`;
+                    
+                    imgContainer.appendChild(img);
+                    imgContainer.appendChild(caption);
+                    visualizations.appendChild(imgContainer);
+                });
+            } else {
+                vizSection.classList.add('hidden');
+            }
+            
+            // Show results with animation
+            results.classList.remove('hidden');
+            results.style.opacity = '0';
+            results.style.transform = 'translateY(20px)';
+            setTimeout(() => {
+                results.style.transition = 'all 0.5s ease';
+                results.style.opacity = '1';
+                results.style.transform = 'translateY(0)';
+            }, 100);
+        }
+
+        function showError(message) {
+            errorMessage.textContent = message;
+            error.classList.remove('hidden');
+        }
+    </script>
+</body>
+</html> 

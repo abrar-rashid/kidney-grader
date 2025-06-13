@@ -7,11 +7,11 @@ from skimage.measure import regionprops_table
 
 from skimage.measure import regionprops
 
-def count_cells_in_tubules(cell_coords, instance_mask, foci_mask):
-    # for each tubule, record its cell count, position, and ids of itself and the focus it is assigned to.
+def count_cells_in_tubules(cell_coords, instance_mask):
+    # for each tubule, record its cell count, position, and id
 
     if len(cell_coords) == 0:
-        return pd.DataFrame(columns=['tubule_id', 'x', 'y', 'cell_count', 'focus_id'])
+        return pd.DataFrame(columns=['tubule_id', 'x', 'y', 'cell_count'])
 
     cell_coords = cell_coords.astype(int)
     cells_y, cells_x = cell_coords[:, 0], cell_coords[:, 1]
@@ -41,17 +41,15 @@ def count_cells_in_tubules(cell_coords, instance_mask, foci_mask):
         if tub_id not in id_to_count:
             continue
         y, x = region.centroid
-        focus_id = foci_mask[int(y), int(x)]
         results.append({
             'tubule_id': int(tub_id),
             'x': x,
             'y': y,
-            'cell_count': int(id_to_count[tub_id]),
-            'focus_id': int(focus_id)
+            'cell_count': int(id_to_count[tub_id])
         })
 
     if not results:
-        return pd.DataFrame(columns=['tubule_id', 'x', 'y', 'cell_count', 'focus_id'])
+        return pd.DataFrame(columns=['tubule_id', 'x', 'y', 'cell_count'])
 
     return pd.DataFrame(results).sort_values("cell_count", ascending=False)
 
@@ -86,28 +84,24 @@ def convert_numpy_types(obj):
 def analyze_tubule_cell_distribution(counts_df):
     # analyses overall distribution and computes aggregate statistics 
     if counts_df.empty:
-        return {}
+        return {
+            "total_tubules": 0,
+            "total_cells": 0,
+            "mean_cells_per_tubule": 0.0,
+            "std_cells_per_tubule": 0.0,
+            "max_cells_in_tubule": 0,
+            "cell_count_distribution": {}
+        }
 
     stats = {
         "total_tubules": len(counts_df),
         "total_cells": counts_df['cell_count'].sum(),
         "mean_cells_per_tubule": counts_df['cell_count'].mean(),
         "std_cells_per_tubule": counts_df['cell_count'].std(),
-        "max_cells_in_tubule": counts_df['cell_count'].max(),
-        "total_foci": len(np.unique(counts_df['focus_id']))
+        "max_cells_in_tubule": counts_df['cell_count'].max()
     }
-    
-    # stats for foci for the grading stage
-    focus_stats = counts_df.groupby('focus_id').agg({
-        'cell_count': ['count', 'sum', 'mean', 'max']
-    }).reset_index()
-    
-    focus_stats.columns = ['focus_id', 'num_tubules', 'total_cells', 
-                          'mean_cells_per_tubule', 'max_cells_in_tubule']
-    
-    stats['focus_stats'] = focus_stats.to_dict('records')
-    
+
     stats['cell_count_distribution'] = counts_df['cell_count'].value_counts().sort_index().to_dict()
     
     return stats
-
+s

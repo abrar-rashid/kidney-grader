@@ -1,3 +1,14 @@
+
+# from the kidney-grader root directory:
+# python single_stage_pipeline/inference_regressor.py --wsi path/to/slide.svs --output_dir results/ --model single_stage_pipeline/checkpoints_regressor/cv_fold_0/best_model.pth
+
+# run from the single_stage_pipeline directory:
+# python inference_regressor.py --wsi path/to/slide.svs --output_dir results/ --model checkpoints_regressor/cv_fold_0/best_model.pth
+
+# force regeneration of features:
+# python single_stage_pipeline/inference_regressor.py --wsi path/to/slide.svs --output_dir results/ --model single_stage_pipeline/checkpoints_regressor/cv_fold_0/best_model.pth --force
+
+
 import os
 import sys
 import yaml
@@ -17,12 +28,34 @@ from matplotlib.colors import Normalize
 import cv2
 import openslide
 
-sys.path.append(str(Path(__file__).parent))
-sys.path.append(str(Path(__file__).parent.parent))
+script_dir = Path(__file__).parent
+root_dir = script_dir.parent 
 
-from models import create_clam_regressor
-from training.dataset import WSIFeaturesDataset
-from preprocessing import UNIFeatureExtractor, KidneyPatchExtractor
+sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(script_dir))
+
+try:
+    from single_stage_pipeline.models import create_clam_regressor
+    from single_stage_pipeline.training.dataset import WSIFeaturesDataset
+except ImportError:
+    from models import create_clam_regressor
+    from training.dataset import WSIFeaturesDataset
+
+try:
+    from single_stage_pipeline.preprocessing import UNIFeatureExtractor, KidneyPatchExtractor
+except ImportError:
+    try:
+        from preprocessing import UNIFeatureExtractor, KidneyPatchExtractor
+    except ImportError:
+        try:
+            from uni_feature_extractor import UNIFeatureExtractor
+        except ImportError:
+            from single_stage_pipeline.preprocessing.uni_feature_extractor import UNIFeatureExtractor
+        
+        try:
+            from single_stage_pipeline.preprocessing.patch_extractor import KidneyPatchExtractor
+        except ImportError:
+            from preprocessing.patch_extractor import KidneyPatchExtractor
 
 
 class CLAMRegressorInference:    

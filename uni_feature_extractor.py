@@ -39,26 +39,14 @@ class UNIFeatureExtractor:
         
         try:
             if model_type == 'UNI':
-                # Try to load UNI from Hugging Face Hub (requires authentication)
+                # Try to load UNI from Hugging Face Hub (requires authentication and access approval)
                 try:
-                    from huggingface_hub import login
+                    print("Attempting to load UNI model from Hugging Face Hub...")
+                    print("Note: UNI requires access approval at https://huggingface.co/MahmoodLab/UNI")
                     
-                    # Check if user is already logged in by trying to access a token
-                    try:
-                        from huggingface_hub import HfFolder
-                        token = HfFolder.get_token()
-                        if token is None:
-                            print("Warning: No Hugging Face token found. UNI requires authentication.")
-                            print("Please run: huggingface-cli login")
-                            raise Exception("HF authentication required")
-                    except:
-                        print("Warning: Cannot verify Hugging Face authentication.")
-                        print("Please run: huggingface-cli login")
-                        raise Exception("HF authentication required")
-                    
-                    # Load UNI from Hugging Face Hub
+                    # Load UNI from Hugging Face Hub with correct format
                     model = timm.create_model(
-                        "hf-hub:MahmoodLab/uni", 
+                        "hf_hub:MahmoodLab/UNI",  # correct format 
                         pretrained=True, 
                         init_values=1e-5, 
                         dynamic_img_size=True,
@@ -68,8 +56,11 @@ class UNIFeatureExtractor:
                     print("Successfully loaded UNI model from Hugging Face Hub")
                     
                 except Exception as hf_error:
-                    print(f"Error loading UNI from Hugging Face: {hf_error}")
-                    print("Falling back to ImageNet ViT-Large...")
+                    print(f"Could not load UNI model: {hf_error}")
+                    if "403" in str(hf_error) or "unauthorized" in str(hf_error).lower():
+                        print("ACCESS REQUIRED: Please visit https://huggingface.co/MahmoodLab/UNI to request access")
+                        print("Once approved, the UNI model will work automatically")
+                    print("Falling back to ImageNet ViT-Large (similar architecture)...")
                     raise hf_error
                     
             # elif model_type == 'CTransPath':
@@ -83,6 +74,7 @@ class UNIFeatureExtractor:
                 # checkpoint = torch.load('path/to/ctranspath.pth')
                 # model.load_state_dict(checkpoint)
             else:  # default to ViT-Large
+                print(f"Loading {model_type} model...")
                 model = timm.create_model(
                     'vit_large_patch16_224',
                     pretrained=True,
@@ -102,7 +94,7 @@ class UNIFeatureExtractor:
             
         except Exception as e:
             print(f"Error loading {model_type} model: {e}")
-            print("Falling back to ImageNet ViT-Large")
+            print("Using ImageNet ViT-Large as fallback (1024-dim features, good for histopathology)")
             
             # Fallback to ImageNet pretrained ViT-Large
             model = timm.create_model(
@@ -118,6 +110,7 @@ class UNIFeatureExtractor:
             if self.precision == 'fp16':
                 model = model.half()
                 
+            print("ViT-Large fallback model loaded successfully")
             return model
     
     def _get_transform(self) -> transforms.Compose:
@@ -156,7 +149,8 @@ class UNIFeatureExtractor:
                 
                 # Extract features
                 features = self.model(batch_tensor)
-                features = features.cpu().numpy()
+                # Keep as float32 for maximum model performance
+                features = features.cpu().numpy().astype(np.float32)
                 
                 features_list.append(features)
         

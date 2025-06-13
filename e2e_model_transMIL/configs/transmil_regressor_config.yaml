@@ -1,0 +1,105 @@
+model:
+  name: "TransMIL"
+  task: "regression"
+  
+  # transformer architecture
+  feature_dim: 1024  # UNI feature dimension
+  hidden_dim: 256    # reduced for small dataset to prevent overfitting
+  num_layers: 2      # relatively shallow for small dataset
+  num_heads: 8       # multi-head attention
+  dropout: 0.3       # moderate dropout for regularization
+  
+  # tubulitis-specific settings
+  max_patches: 10000  # leverage 24-48GB memory for larger patch sets
+  min_patches: 10    # minimum patches required
+
+training:
+  lr: 0.003
+  weight_decay: 0.01   # reduced from 0.02 - less regularization initially  
+  optimizer: "adamw"
+  scheduler: "cosine_annealing"
+  
+  epochs: 500        # more epochs for small dataset
+  early_stopping_patience: 50
+  warmup_epochs: 10  # warmup for stable training
+  
+  # loss weights - rebalanced to focus more on main regression task
+  bag_loss_weight: 0.8     # increased main loss weight
+  instance_loss_weight: 0.15  # reduced auxiliary loss
+  attention_reg_weight: 0.05
+  
+  # gradient clipping for stability
+  gradient_clip_value: 1.0
+  
+  # mixed precision for memory efficiency
+  use_amp: true
+
+data:
+  labels_file: "banff_scores.csv"
+  target_column: "T"
+  features_dir: "./e2e_model_transMIL/data/tubule_features"
+  
+  # patch extraction settings
+  patch_size: 512
+  overlap: 0.25
+  min_tubule_ratio: 0.3
+  tubule_class_id: 1
+  
+  # data loading
+  batch_size: 1      # MIL typically uses batch_size=1
+  num_workers: 4
+  max_patches: 10000  # maximum patches per WSI (memory permitting)
+  min_patches: 10    # minimum patches required
+  
+  # cross-validation
+  n_folds: 5
+  test_size: 18      # held-out test set
+  random_seed: 42
+
+# UNI feature extraction configuration
+feature_extraction:
+  model: "UNI"
+  device: "cuda"
+  batch_size: 64     # for feature extraction
+  precision: "fp32"  # fp32 or fp16
+
+# Legacy feature_extractor section for backward compatibility
+feature_extractor:
+  model_name: "UNI"
+  batch_size: 64     # for feature extraction
+  
+validation:
+  metrics: ["mse", "mae", "r2", "pearson_correlation", "spearman_correlation"]
+  save_predictions: true
+  save_attention_maps: true
+  monitor: "val_mse"
+  mode: "min"
+
+checkpoint:
+  save_dir: "./e2e_model_transMIL/checkpoints_transmil_final"
+  save_best_only: true
+  save_every_n_epochs: 10
+  monitor: "val_mse"
+  mode: "min"
+
+logging:
+  use_wandb: false
+  project_name: "kidney_tubulitis_transmil"
+  log_interval: 1
+  save_attention_visualizations: true
+
+hardware:
+  device: "cuda"
+  mixed_precision: true
+
+# tubule-specific augmentations
+augmentation:
+  feature_noise_std: 0.01
+  feature_dropout_prob: 0.1
+  coordinate_noise_std: 0.05
+
+visualization:
+  save_attention_heatmaps: true
+  attention_output_dir: "./e2e_model_transMIL/visualizations/attention"
+  top_k_patches: 10
+  heatmap_alpha: 0.3
